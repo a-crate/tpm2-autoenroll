@@ -1,7 +1,7 @@
 # tpm2-autoenroll design
 
-Status: draft, pre-implementation
-Target: systemd 260 (verified against 260.2 source)
+Status: section 2 implemented and verified; sections 4-7 not yet built
+Target: systemd 260 (verified against 260.2 source, and against a running 260.2)
 
 ## 1. Problem
 
@@ -120,6 +120,7 @@ PKCS#11/FIDO2/TPM2 logic".
 So the man page tells socket services in advance that a `/cryptsetup-tpm2/`
 request wants a blob. What it does not state, and what comes from the source, is
 that configuring field 3 makes that request unconditional.
+
 ### 2.3 The mechanism that does work
 
 Leave crypttab's key file field empty and place the socket at
@@ -167,6 +168,56 @@ Two consequences worth designing around:
   daemon must therefore run its own retry loop for passphrase typos rather than
   returning a wrong passphrase and burning cryptsetup's remaining attempt.
 - The reply bytes are used **verbatim** as the passphrase. No trailing newline.
+
+### 2.4 The libcryptsetup token plugin pre-empts all of this on success
+
+Established empirically during implementation, against systemd 260.2. An earlier
+draft of 2.3 was incomplete here.
+
+Section 2.2 notes in passing that `cryptsetup.c:2691` gates the libcryptsetup
+token-plugin path on `if (!key_file && use_token_plugins())`, and treats that as
+one more door closed by configuring field 3. But look at the gate from the other
+side. Our configuration is *precisely* `key_file == NULL`, so with the plugin
+present the condition is **true**, and this block sits **before** the retry loop:
+
+    if (!key_file && use_token_plugins()) {
+            r = crypt_activate_by_token_pin_ask_password(...);
+            if (r >= 0) {
+                    log_debug("Volume %s activated with a LUKS token.", volume);
+                    return 0;              /* cryptsetup.c:2701 */
+            }
+            log_debug_errno(r, "Token activation unsuccessful ...");
+    }
+
+`use_token_plugins()` (`cryptsetup.c:1484`) returns true whenever systemd was
+built with `HAVE_LIBCRYPTSETUP_PLUGINS` and `crypt_token_external_path()` finds
+the plugin directory. On any distribution shipping
+`libcryptsetup-token-systemd-tpm2.so` -- nixpkgs does -- that is the normal case.
+
+So on a healthy volume the plugin unseals the token and returns at 2701. The
+retry loop never runs, `discover_key()` is never called, and **the daemon is not
+contacted at all.** Not contacted and declining; simply absent from the path.
+
+This does not break the design, and on reflection it is a small gift:
+
+- **The fallback path is unaffected**, which is the only path that matters.
+  When unsealing fails, `crypt_activate_by_token_pin_ask_password()` returns
+  negative, control falls through to the retry loop, and 2.3 plays out exactly
+  as written: attempt 0 reaches us as `/cryptsetup-tpm2/`, attempt 1 as
+  `/cryptsetup/`. Verified.
+- **On the success path we cost nothing at all** rather than costing one
+  connection.
+
+What it changes is the *scope* of the section 10 risk. The zero-byte decline is
+load-bearing only on the discovery route, and the discovery route is taken only
+when the token plugin is unavailable or fails. That is not a corner case: an
+initrd assembled without `libcryptsetup-token-systemd-tpm2.so` in its closure
+takes the discovery route on every boot, and the initrd is this tool's primary
+stage. Both routes therefore have to work, and both are tested (section 8).
+
+Note for the NixOS module: it must **not** attempt to suppress the plugin to
+force the discovery route. Both routes are correct, and the one that skips us
+entirely is the cheaper one.
 
 ## 3. Architecture
 
@@ -222,12 +273,6 @@ ListenStream=/run/cryptsetup-keys.d/root.key
 ListenStream=/run/cryptsetup-keys.d/data.key
 Accept=no
 SocketMode=0600
-```
-
-Ship a tmpfiles.d entry creating `/run/cryptsetup-keys.d` (mode 0700) regardless
-of whether socket units already create `ListenStream=` parent directories. It
-costs one line and removes a question we would otherwise have to keep answering
-across systemd versions.
 ```
 
 Ship a tmpfiles.d entry creating `/run/cryptsetup-keys.d` (mode 0700) regardless
@@ -520,7 +565,16 @@ Negative cases to assert alongside:
   header write. This proves the attempt-0 empty reply does not break ordinary
   TPM2 unlock, and it is the single most important regression test in the suite
   -- treat it as the canary for systemd upgrades (section 10), not merely as a
-  unit test
+  unit test.
+
+  Because of 2.4 this has to be asserted **twice**, once per route. With the
+  libcryptsetup token plugin available the daemon is never contacted, so the
+  only thing to assert is the user-visible property: the volume unlocks and
+  nothing prompts. Setting `SYSTEMD_CRYPTSETUP_USE_TOKEN_MODULE=0` on the
+  `systemd-cryptsetup@` unit (systemd's own debug switch, `cryptsetup.c:1506`)
+  forces the discovery route, and it is that case which asserts the zero-byte
+  decline specifically. Asserting only the default route would leave the
+  load-bearing behaviour untested
 - a wrong passphrase at the prompt does not produce a consent prompt and does
   not touch the header
 
@@ -587,6 +641,18 @@ but says nothing about what an empty reply means. The behaviour we rely on falls
 out of `iovec_is_set()` requiring `iov_len > 0`
 (`src/fundamental/iovec-util-fundamental.h:43`) combined with the dispatch test
 at `cryptsetup.c:2044`. It is an implementation detail, not a contract.
+
+**Status: confirmed to hold on systemd 260.2.** With the token plugin disabled
+so that the discovery route is taken, systemd-cryptsetup consults the socket as
+`/cryptsetup-tpm2/<volume>`, accepts the zero-byte reply as absent key data, and
+proceeds to unlock from the LUKS2 header token:
+
+    tpm2-autoenrolld: volume "autotest": tpm2 phase, declining with zero bytes
+    systemd-cryptsetup: Automatically discovered security TPM2 token unlocks volume.
+
+Per 2.4, this route is reached only when the libcryptsetup token plugin is
+absent or fails, which narrows the blast radius of a future systemd change but
+does not remove it: an initrd without the plugin takes this route on every boot.
 
 If a future systemd treated an empty reply as an error rather than as absent key
 data, attempt 0 would fail before reaching the header token, and every managed
