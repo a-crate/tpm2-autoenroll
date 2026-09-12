@@ -102,6 +102,13 @@ pkgs.testers.runNixOSTest {
     systemd.services.tpm2-autoenrolld = {
       description = "TPM2 auto-enrollment daemon";
       unitConfig.DefaultDependencies = "no";
+      # The package carries no PATH of its own, so the caller names the three
+      # binaries the daemon shells out to -- systemd-ask-password,
+      # systemd-cryptenroll and cryptsetup. Leaving cryptsetup off is a quiet
+      # failure rather than a loud one: passphrase validation would fail for
+      # every candidate and the daemon would decline every volume, which looks
+      # from the outside like a wrong passphrase.
+      path = [ pkgs.systemd pkgs.cryptsetup ];
       serviceConfig = {
         Type = "exec";
         ExecStart = lib.getExe tpm2-autoenrolld;
