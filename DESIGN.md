@@ -1,7 +1,7 @@
 # tpm2-autoenroll design
 
-Status: sections 2-6 implemented and verified; section 7 (the NixOS module) not
-yet built
+Status: sections 2-7 implemented and verified; section 8 tier 1 covers both the
+daemon and the module, tier 2 not yet built
 Target: systemd 260 (verified against 260.2 source, and against a running 260.2)
 
 ## 1. Problem
@@ -258,28 +258,48 @@ volume (`getsockname(2)` on the path); the peer name identifies the phase
 ### 3.1 Unit ordering
 
 The socket must be listening before any `systemd-cryptsetup@.service` starts.
-`cryptsetup-pre.target` is the anchor for that in both stages; the
-`initrd-switch-root.target` lines below apply only to the initrd copy of the
+The `initrd-switch-root.target` lines below apply only to the initrd copy of the
 unit and are omitted from the system-stage copy.
 
 ```
 [Unit]
 DefaultDependencies=no
 Before=cryptsetup-pre.target
-Conflicts=initrd-switch-root.target      # initrd stage only
-Before=initrd-switch-root.target         # initrd stage only
+Before=systemd-cryptsetup@root.service    # one per volume in this stage
+Wants=... (via [Install] WantedBy=)       # the same units
+Conflicts=initrd-switch-root.target       # initrd stage only
+Before=initrd-switch-root.target          # initrd stage only
 
 [Socket]
 ListenStream=/run/cryptsetup-keys.d/root.key
 ListenStream=/run/cryptsetup-keys.d/data.key
 Accept=no
 SocketMode=0600
+DirectoryMode=0700
 ```
 
-Ship a tmpfiles.d entry creating `/run/cryptsetup-keys.d` (mode 0700) regardless
-of whether socket units already create `ListenStream=` parent directories. It
-costs one line and removes a question we would otherwise have to keep answering
-across systemd versions.
+Two corrections to an earlier draft, both found while building section 7.
+
+**`cryptsetup-pre.target` is not sufficient on its own.** It looked like the
+natural anchor because it is the target `systemd-cryptsetup@.service` is ordered
+after in both stages. But it carries `RefuseManualStart=yes` and is pulled in
+only by the cryptsetup generator, so on a machine where it never starts,
+ordering before it constrains nothing. What actually guarantees we are listening
+is naming the instances: one `Before=` and one `WantedBy=` per
+`systemd-cryptsetup@<volume>.service` in that stage. The `Wants` is what starts
+the socket at all -- it is deliberately not wanted by `sockets.target`, which in
+the initrd sits behind `basic.target` and is far too late -- and the `Before` is
+what makes it start first. nixpkgs' own clevis unit is wired the same way. The
+`Before=cryptsetup-pre.target` line stays as documentation of intent; it is the
+per-instance pair that carries the weight.
+
+**The tmpfiles.d entry is unnecessary.** An earlier draft hedged: ship one
+"regardless of whether socket units already create `ListenStream=` parent
+directories". systemd.socket(5) settles the question -- they are created
+automatically, and `DirectoryMode=` is the setting that picks their mode. One
+line in `[Socket]` replaces a tmpfiles.d entry whose ordering in the initrd we
+would otherwise have had to prove was early enough, which was the real cost the
+hedge was trying to avoid paying.
 
 ### 3.2 Connection handling
 
@@ -647,7 +667,6 @@ services.tpm2-autoenroll = {
   # Global defaults, overridable per volume.
   tpm2Device = "auto";
   tpm2Pcrs   = [ 7 ];
-  wipeSlot   = "tpm2";
   enrollIfAbsent = false;     # only repair drifted bindings, do not create new ones
 
   volumes.root = {
@@ -667,15 +686,28 @@ The attribute name is the *volume* (mapper) name. It must match the crypttab
 entry, because that name is what appears in both the socket path and the
 bindname.
 
+An earlier draft had a `wipeSlot` global here. It is dropped: `enroll.rs` passes
+`--wipe-slot=tpm2` unconditionally and 7.1 has no field to carry anything else,
+so the option would have been a knob that did nothing.
+
 The module:
 
 - writes the `.socket` unit with one `ListenStream=` per volume in that stage,
   plus the `.service` unit for the daemon, into `boot.initrd.systemd.units`
   and/or `systemd.units` as appropriate
-- writes a tmpfiles.d entry for `/run/cryptsetup-keys.d` (3.1)
 - writes a daemon config file (JSON) enumerating volumes and their parameters
-- adds the daemon, `systemd-cryptenroll`, and the tpm2 libraries to
-  `boot.initrd.systemd.storePaths` when any volume is in the initrd stage
+- adds the daemon and the three binaries it shells out to
+  (`systemd-ask-password`, `systemd-cryptenroll`, `cryptsetup`) to
+  `boot.initrd.systemd.storePaths` when any volume is in the initrd stage, and
+  names the same packages in the service's `path` so the initrd's systemd is the
+  one that gets used
+
+The last point is why the package ships **unwrapped**. A `wrapProgram --prefix
+PATH` would be the obvious way to make the daemon self-contained, but it puts
+both `systemd` and `cryptsetup` in the package's own closure, and the initrd
+then copies a second full systemd no matter how carefully the storePaths list
+names individual binaries. PATH belongs to whoever knows the stage, which is the
+module.
 
 Assertions:
 
@@ -822,6 +854,38 @@ is a `systemctl start` rather than a reboot:
 - **never enrolled** -- a volume with no systemd-tpm2 token and `enrollIfAbsent`
   unset must be left exactly as it is.
 
+### The module cases
+
+The cases above all run against hand-written units and a hand-written config
+file, which means they say nothing about whether section 7 produces working
+ones. A second tier 1 machine is configured **only** through
+`services.tpm2-autoenroll` -- the sole thing written by hand is `/etc/crypttab`,
+because NixOS has no stage-2 equivalent of `boot.initrd.luks.devices`.
+
+- the socket is listening **before** the volume it serves, with nothing in the
+  test arranging that. This is the assertion that would have caught the
+  `cryptsetup-pre.target` mistake in 3.1: the socket is started by its
+  `WantedBy=` on `systemd-cryptsetup@<volume>.service` and ordered by the
+  matching `Before=`, and if either were missing the volume would still unlock
+  -- silently losing the feature rather than failing.
+- `/run/cryptsetup-keys.d` comes out `0700` with no tmpfiles.d entry anywhere in
+  the configuration, which is the other half of the same correction.
+- the config file's contents equal the module's globals merged with each
+  volume's overrides. One volume takes every default and one overrides every
+  field, so 7.1's "values arrive already resolved" is visible in the file rather
+  than merely asserted.
+- neither unit is running before a volume needs one, and on a healthy unlock the
+  *service* is never started at all -- 2.4's "we cost nothing" as an observable
+  property rather than an argument.
+- a drift is repaired end to end over the generated wiring, so a passing module
+  test is not just a passing unit-file diff.
+
+These run at `stage = "system"`, where the test can drive the units directly.
+The initrd stage differs only in which attribute set the same two units are
+written into; that it assembles -- config file, daemon, and the three helper
+binaries with their libraries, all present in the cpio -- is checked by building
+the initrd, not by booting one. A tier 2 test is what would boot it.
+
 ## 9. Implementation notes
 
 Rust. The daemon needs `getpeername`/`getsockname` on AF_UNIX with abstract
@@ -841,7 +905,11 @@ linking tpm2-tss would not.
 The runtime dependencies are therefore three binaries on `PATH`:
 `systemd-ask-password`, `systemd-cryptenroll` and `cryptsetup`. The first two
 were always expected; `cryptsetup` arrives with passphrase validation (3.3) and
-is reused for the strong form of verification (4.3).
+is reused for the strong form of verification (4.3). Supplying them is the
+caller's job rather than the package's, for the closure reason in section 7 --
+and getting it wrong is quiet rather than loud, since a missing `cryptsetup`
+makes every passphrase fail validation and so looks from the outside exactly
+like a user who typed it wrong.
 
 Secret hygiene: `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)` at startup
 (systemd-cryptsetup does exactly this at `cryptsetup.c:2625`, self-deprecatingly
@@ -867,10 +935,21 @@ from the booted system -- each captures its own stage's PCR state, which is the
 correct state for it.
 
 The one thing worth warning about in the module: a **system**-stage volume bound
-to PCR 11 or above is binding to values that userspace continues to extend after
-the point of measurement. That is a footgun inherent to the PCR choice, not to
-this tool, but the module should warn on it because this tool makes such a
-configuration easy to create by accident.
+to a register that userspace continues to extend after the point of measurement
+would seal against a state that has already moved on by the next unlock. That is
+a footgun inherent to the PCR choice, not to this tool, but the module warns on
+it because this tool makes such a configuration easy to create by accident.
+
+An earlier draft said "PCR 11 or above", and the module test caught that being
+wrong on its first run: it enrolls against **PCR 16**, the debug PCR, which
+nothing extends unless asked to, and the warning fired. The registers systemd's
+userspace tooling actually extends are 11 (`systemd-pcrphase`, at `leave-initrd`
+and again at sysinit and ready), 12 (kernel command line and credentials), 13
+(system extension images) and 15 (machine ID and file system identity). 14 is
+the shim MOK list, extended in the boot-loader phase and not after; 16 is the
+debug PCR; 17-22 are D-RTM. Warning on those would be a false positive on every
+use of the debug PCR, including this tool's own tests -- which is exactly how a
+warning gets trained away.
 
 ## 10. Known risk: an undocumented behaviour is load-bearing
 
