@@ -251,6 +251,19 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"cryptsetup luksDump {device} | grep -q systemd-tpm2")
 
 
+    def token_index(device):
+        """Which token slot the systemd-tpm2 enrollment occupies, or None."""
+        import json
+
+        meta = json.loads(
+            machine.succeed(f"cryptsetup luksDump --dump-json-metadata {device}")
+        )
+        for index, token in meta.get("tokens", {}).items():
+            if token.get("type") == "systemd-tpm2":
+                return int(index)
+        return None
+
+
     def mangle_token_blob(device):
         """Break unsealing without touching the policy or the PCRs.
 
@@ -260,8 +273,16 @@ pkgs.testers.runNixOSTest {
         compares against -- stays exactly as enrolled."""
         import json
 
+        # Not necessarily token 0: systemd-cryptenroll adds the new token before
+        # wiping the old one, so a re-enrolled volume's token has moved up.
+        index = token_index(device)
+        assert index is not None, (
+            f"token_index({device}) returned None, expected a systemd-tpm2 token "
+            "to mangle"
+        )
+
         token = json.loads(
-            machine.succeed(f"cryptsetup token export --token-id 0 {device}")
+            machine.succeed(f"cryptsetup token export --token-id {index} {device}")
         )
 
         def flatten(value):
@@ -275,12 +296,12 @@ pkgs.testers.runNixOSTest {
             [flatten(b) for b in blob] if isinstance(blob, list) else flatten(blob)
         )
 
-        machine.succeed(f"cryptsetup token remove --token-id 0 {device}")
+        machine.succeed(f"cryptsetup token remove --token-id {index} {device}")
         machine.succeed(
             f"cat > /tmp/token.json <<'EOF'\n{json.dumps(token)}\nEOF"
         )
         machine.succeed(
-            f"cryptsetup token import --token-id 0 --json-file /tmp/token.json {device}"
+            f"cryptsetup token import --token-id {index} --json-file /tmp/token.json {device}"
         )
 
 
@@ -302,11 +323,12 @@ pkgs.testers.runNixOSTest {
     machine.succeed(f"test -S /run/cryptsetup-keys.d/{VOLUME}.key")
     machine.succeed(f"test -S /run/cryptsetup-keys.d/{VOLUME2}.key")
 
-    with subtest("two LUKS2 volumes bound to PCR 16, sharing a passphrase"):
-        # Both are enrolled before PCR 16 is touched, so both seal against the
-        # same value and both go stale at the same moment.
+    with subtest("three LUKS2 volumes bound to PCR 16, sharing a passphrase"):
+        # All enrolled before PCR 16 is touched, so they seal against the same
+        # value and go stale at the same moment.
         format_and_enroll(DEVICE)
         format_and_enroll(DEVICE2)
+        format_and_enroll(DEVICE3)
 
     with subtest("token plugin route: our socket does not disturb a healthy unlock"):
         set_token_plugin(True)
@@ -372,10 +394,13 @@ pkgs.testers.runNixOSTest {
 
         watch = LogWatch()
         machine.succeed(f"systemctl start --no-block {UNIT}")
-        # The wrong answer must be rejected by us, not by systemd-cryptsetup:
+        # Three answers, in the order the daemon asks for them: a typo, the
+        # real passphrase, and then a refusal at the consent prompt. The wrong
+        # answer must be rejected by us rather than by systemd-cryptsetup --
         # section 2.3 gives us exactly one attempt, and handing back a typo
-        # would spend it.
-        machine.succeed(f"answer-passphrase {WRONG} {PASSPHRASE}")
+        # would spend it. Refusing consent keeps this subtest's assertion that
+        # the header is untouched.
+        machine.succeed(f"answer-passphrase {WRONG} {PASSPHRASE} n")
         machine.wait_for_unit(UNIT)
         machine.succeed(f"test -b /dev/mapper/{VOLUME}")
 
@@ -397,11 +422,17 @@ pkgs.testers.runNixOSTest {
             "only the validated passphrase may be handed to systemd-cryptsetup"
         )
 
+        assert "re-enrollment was declined" in log, (
+            f"after refusing at the consent prompt the new daemon output was:\n{log}\n"
+            "expected a 're-enrollment was declined' line"
+        )
+
         after = header_digest(DEVICE)
         assert before == after, (
             f"cryptsetup luksDump {DEVICE} digest was {before} before the "
             f"fallback unlock and {after} after, expected them to be equal: "
-            "this slice must not touch the LUKS header"
+            "a declined consent must leave the header exactly as it was "
+            "(DESIGN.md section 6)"
         )
 
     with subtest("a second volume is answered from cache without a second prompt"):
@@ -420,10 +451,20 @@ pkgs.testers.runNixOSTest {
             "expected an 'answered from a passphrase seen earlier this boot' "
             "line, meaning the in-process cache covered it"
         )
+        # Section 11 asked whether a refusal should carry across volumes that
+        # share a boot state. It does: autotest2 is bound to the same register
+        # holding the same value, so the question was already answered and is
+        # not asked twice.
+        assert "already declined for this boot state" in log, (
+            f"unlocking the second volume produced:\n{log}\n"
+            "expected an 'already declined for this boot state' line: the "
+            "refusal given for the first volume covers this one"
+        )
         pending = pending_password_requests()
         assert pending == "", (
             f"pending_password_requests() returned {pending!r}, expected an "
-            "empty string: the second volume must not prompt again"
+            "empty string: the second volume must prompt for neither the "
+            "passphrase nor consent"
         )
 
         after = header_digest(DEVICE2)
@@ -439,12 +480,21 @@ pkgs.testers.runNixOSTest {
         # a re-enrollment would seal against.
         log = "\n".join(daemon_log_lines())
         for volume in (VOLUME, VOLUME2):
-            expected = f'volume "{volume}": token 0: the boot measurements have changed'
+            expected = (
+                f'volume "{volume}": the TPM2 binding has gone stale and can be repaired'
+            )
             assert expected in log, (
                 f"the daemon output was:\n{log}\n"
                 f"expected a {expected!r} line: PCR 16 was extended after "
                 "enrollment, so the sealed policy can no longer be satisfied"
             )
+        # Section 6 wants the event auditable: what the policy was, what it is
+        # becoming, and the measurement behind the change.
+        assert re.search(r"can be repaired \(policy [0-9a-f]{16}\.\.\. -> [0-9a-f]{16}\.\.\.\)", log), (
+            f"the daemon output was:\n{log}\n"
+            "expected the repair line to name both the old and the new policy "
+            "digest"
+        )
         assert re.search(r'PCR 16 is now [0-9a-f]{64}', log), (
             f"the daemon output was:\n{log}\n"
             "expected a 'PCR 16 is now <sha256>' line recording the state a "
@@ -461,20 +511,25 @@ pkgs.testers.runNixOSTest {
         # The pathological case section 4.1's last check exists for: the volume
         # falls back to a passphrase while its sealed policy still matches the
         # PCRs exactly. Re-sealing the very same policy would leave the next
-        # boot failing the same way, so the daemon must not read this as drift.
+        # boot failing the same way, so the daemon must decline -- and must not
+        # reach the consent prompt, since there is nothing to consent to.
         #
-        # Manufactured by mangling the token's sealed blob, which makes
-        # unsealing fail while leaving tpm2-policy-hash and the PCRs alone.
-        # (A mangled blob would in fact be repaired by re-enrolling; the check
-        # is deliberately conservative and cannot tell that case apart from one
-        # where re-sealing changes nothing. Declining costs a manual repair,
-        # guessing costs a header rewrite on every boot.)
+        # Manufactured by re-sealing autotest3 against the PCR 16 value that is
+        # live right now, then mangling the token's blob so unsealing fails
+        # while tpm2-policy-hash and the PCRs stay untouched. (A mangled blob
+        # would in fact be repaired by re-enrolling; the check is deliberately
+        # conservative and cannot tell that case from one where re-sealing
+        # changes nothing. Declining costs a manual repair, guessing costs a
+        # header rewrite on every boot forever.)
         #
         # It doubles as the proof that the daemon's trial-session digest really
         # does reproduce what systemd-cryptenroll sealed: the two digests were
         # computed by different code from different directions, and the
         # assertion is that they come out equal.
-        format_and_enroll(DEVICE3)
+        machine.succeed(
+            f"PASSWORD={PASSPHRASE} {CRYPTENROLL} --wipe-slot=tpm2 "
+            f"--tpm2-device=auto --tpm2-pcrs=16 {DEVICE3}"
+        )
         mangle_token_blob(DEVICE3)
         before = header_digest(DEVICE3)
         watch = LogWatch()
@@ -485,8 +540,8 @@ pkgs.testers.runNixOSTest {
         log = watch.new()
         assert "plain phase" in log, (
             f"unlocking autotest3 produced:\n{log}\n"
-            "expected a 'plain phase' line: with tpm2-device pointing at a "
-            "device that does not exist, systemd-cryptsetup must fall back to us"
+            "expected a 'plain phase' line: a token whose blob will not unseal "
+            "must fall back to us"
         )
         expected = "the current PCRs still satisfy the enrolled policy"
         assert expected in log, (
@@ -496,10 +551,10 @@ pkgs.testers.runNixOSTest {
             "systemd-cryptenroll sealed with, for a volume whose PCRs have not "
             "moved at all"
         )
-        assert "the boot measurements have changed" not in log, (
+        assert "consent" not in log, (
             f"unlocking autotest3 produced:\n{log}\n"
-            "expected no drift line: this volume's PCRs are exactly what it was "
-            "enrolled against"
+            "expected no mention of consent: with nothing to repair the user "
+            "must not be asked to approve a repair"
         )
 
         after = header_digest(DEVICE3)
@@ -507,13 +562,91 @@ pkgs.testers.runNixOSTest {
             f"cryptsetup luksDump {DEVICE3} digest was {before} before and "
             f"{after} after, expected them to be equal"
         )
+        machine.succeed(f"systemctl stop {UNIT3}")
+
+    with subtest("consent accepted: the binding is repaired and verified"):
+        # The state machine this tool exists for, end to end. PCR 16 moves
+        # again, which both re-breaks autotest3's policy and -- because the
+        # consent cache is keyed by boot state -- makes this a question the
+        # daemon has not been told the answer to.
+        machine.succeed(
+            "tpm2_pcrextend 16:sha256=$(head -c32 /dev/urandom | sha256sum | cut -d' ' -f1)"
+        )
+        before = header_digest(DEVICE3)
+        before_token = token_index(DEVICE3)
+        watch = LogWatch()
+
+        machine.succeed(f"systemctl start --no-block {UNIT3}")
+        # One answer only: the passphrase comes from the cache, so the consent
+        # prompt is the only thing asked.
+        machine.succeed("answer-passphrase y")
+        machine.wait_for_unit(UNIT3)
+        machine.succeed(f"test -b /dev/mapper/{VOLUME3}")
+
+        log = watch.new()
+        assert "the TPM2 binding has gone stale and can be repaired" in log, (
+            f"unlocking autotest3 after the second extend produced:\n{log}\n"
+            "expected the preflight to find a repairable binding"
+        )
+        # Section 4.3 requires the new slot to be checked before it is trusted,
+        # by whichever of the two routes is available. On NixOS it is always the
+        # second: nixpkgs ships libcryptsetup-token-systemd-tpm2.so in systemd's
+        # output rather than in cryptsetup's plugin directory, so the standalone
+        # CLI cannot load it and `--token-only` finds no usable token. Accept
+        # either, but insist that one of them ran and passed.
+        assert re.search(
+            r"re-enrolled as token \d+"
+            r"( and verified by unsealing it|, and its policy matches the current PCRs)",
+            log,
+        ), (
+            f"unlocking autotest3 after the second extend produced:\n{log}\n"
+            "expected a 're-enrolled as token N' line reporting a successful "
+            "verification, by unsealing or by policy comparison"
+        )
+
+        after = header_digest(DEVICE3)
+        assert before != after, (
+            f"cryptsetup luksDump {DEVICE3} digest was {before} before and "
+            f"{after} after, expected them to differ: consent was given, so "
+            "the header must have been rewritten"
+        )
+        after_token = token_index(DEVICE3)
+        assert before_token != after_token, (
+            f"the systemd-tpm2 token was at index {before_token} before and "
+            f"{after_token} after, expected a different index: --wipe-slot=tpm2 "
+            "removes the old token and enrollment adds a new one"
+        )
+
+    with subtest("the repaired volume unlocks with no prompt at all"):
+        # Section 8's "boot 3", without needing a reboot: PCR 16 has not moved
+        # since the re-enrollment, so the freshly sealed policy is satisfied and
+        # the volume unlocks silently. This is the assertion that the repair was
+        # a real repair rather than a plausible-looking header write.
+        machine.succeed(f"systemctl stop {UNIT3}")
+        watch = LogWatch()
+
+        machine.succeed(f"systemctl start {UNIT3}")
+        machine.succeed(f"test -b /dev/mapper/{VOLUME3}")
+
+        log = watch.new()
+        assert "plain phase" not in log, (
+            f"restarting autotest3 after the repair produced:\n{log}\n"
+            "expected no 'plain phase' line: the volume should now unseal from "
+            "its own token without consulting us for a passphrase"
+        )
+        pending = pending_password_requests()
+        assert pending == "", (
+            f"pending_password_requests() returned {pending!r}, expected an "
+            "empty string: a repaired volume must unlock as silently as one "
+            "that never drifted"
+        )
 
     with subtest("a volume with no TPM2 token is left alone"):
-        # "Never enrolled" rather than "drifted". Re-enrolling here would be
-        # creating a binding the user never asked for, which is what
-        # enrollIfAbsent exists to gate.
+        # "Never enrolled" rather than "drifted", and enrollIfAbsent is off.
+        # Creating a binding the user never asked for is not a repair.
         machine.succeed(f"systemctl stop {UNIT3}")
         machine.succeed(f"{CRYPTENROLL} --wipe-slot=tpm2 {DEVICE3}")
+        before = header_digest(DEVICE3)
         watch = LogWatch()
 
         machine.succeed(f"systemctl start {UNIT3}")
@@ -524,6 +657,13 @@ pkgs.testers.runNixOSTest {
         assert expected in log, (
             f"unlocking a volume with its TPM2 token wiped produced:\n{log}\n"
             f"expected a {expected!r} line"
+        )
+
+        after = header_digest(DEVICE3)
+        assert before == after, (
+            f"cryptsetup luksDump {DEVICE3} digest was {before} before and "
+            f"{after} after, expected them to be equal: without enrollIfAbsent "
+            "an unenrolled volume must be left exactly as it is"
         )
 
     with subtest("both sockets were matched to their configuration at startup"):
@@ -542,6 +682,7 @@ pkgs.testers.runNixOSTest {
     with subtest("the volumes are usable"):
         machine.succeed(f"mkfs.ext4 /dev/mapper/{VOLUME}")
         machine.succeed(f"mkfs.ext4 /dev/mapper/{VOLUME2}")
-        machine.succeed(f"systemctl stop {UNIT} {UNIT2}")
+        machine.succeed(f"mkfs.ext4 /dev/mapper/{VOLUME3}")
+        machine.succeed(f"systemctl stop {UNIT} {UNIT2} {UNIT3}")
   '';
 }

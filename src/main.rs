@@ -1,4 +1,5 @@
-//! tpm2-autoenrolld -- the plain-phase passphrase path.
+//! tpm2-autoenrolld -- re-bind a TPM2-enrolled LUKS2 volume at the point of
+//! unlock.
 //!
 //! Sits on the `/run/cryptsetup-keys.d/<volume>.key` key-discovery path that
 //! systemd-cryptsetup consults on every iteration of its unlock loop, and
@@ -18,19 +19,29 @@
 //!     user itself (DESIGN.md section 2.3), so a typo is retried here rather
 //!     than spent there.
 //!
-//! What it does not do yet: anything to the LUKS2 header. There is no preflight,
-//! no `systemd-cryptenroll`, no consent prompt. Installing this build still
-//! changes no boot outcome, which is what keeps the canary test meaningful.
+//! Having established that the volume really has fallen back and that we hold a
+//! passphrase that really works, the plain phase then does what the tool exists
+//! for: check that re-binding would actually help (`preflight`), ask a human
+//! (`consent`), run `systemd-cryptenroll`, and verify the result -- all before
+//! the passphrase is returned, so nothing is half-done if the initrd goes away.
+//!
+//! The invariant underneath all of it is **enroll at the point of unlock**. The
+//! PCR values read when we are consulted are, by construction, the values that
+//! will be present the next time this volume is unlocked at this same point in
+//! boot. Nothing here knows or cares whether that point is in the initrd.
 
 mod askpw;
 mod bindname;
 mod cache;
 mod config;
+mod consent;
 mod drift;
+mod enroll;
 mod listen_fds;
 mod log;
 mod luks;
 mod memfd;
+mod preflight;
 mod secret;
 mod token;
 mod tpm2;
@@ -45,6 +56,7 @@ use rustix::net::{SocketAddrAny, SocketAddrUnix};
 use crate::askpw::Attempt;
 use crate::bindname::Phase;
 use crate::cache::Cache;
+use crate::drift::Drift;
 use crate::log::{error, info, notice, warning};
 use crate::luks::Verdict;
 use crate::secret::Secret;
@@ -211,6 +223,9 @@ fn unix_addr(addr: &SocketAddrAny) -> Option<SocketAddrUnix> {
 /// handled after the first has produced a passphrase, not alongside it.
 fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 	let mut cache = Cache::new();
+	// Both of these live for the daemon's lifetime, which in the initrd is the
+	// initrd: one passphrase typed once, and one refusal honoured once.
+	let mut declined = consent::Declined::new();
 
 	loop {
 		let mut polls: Vec<PollFd> = listeners
@@ -237,7 +252,7 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 		for i in ready {
 			let l = &listeners[i];
 			match rustix::net::accept(&l.fd) {
-				Ok(conn) => handle(conn, l, &mut cache),
+				Ok(conn) => handle(conn, l, &mut cache, &mut declined),
 				Err(rustix::io::Errno::INTR) | Err(rustix::io::Errno::AGAIN) => {}
 				Err(e) => error!("volume {:?}: accept failed: {e}", l.volume),
 			}
@@ -253,7 +268,12 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 /// volume that disagrees with the socket it arrived on, or a volume we have no
 /// configuration for all degrade to stock systemd-cryptsetup behaviour rather
 /// than guessing.
-fn handle(conn: OwnedFd, listener: &Listener, cache: &mut Cache) {
+fn handle(
+	conn: OwnedFd,
+	listener: &Listener,
+	cache: &mut Cache,
+	declined: &mut consent::Declined,
+) {
 	let volume = listener.volume.as_str();
 
 	// `None` means the peer never bound a name of its own. systemd-cryptsetup
@@ -300,7 +320,7 @@ fn handle(conn: OwnedFd, listener: &Listener, cache: &mut Cache) {
 
 	match peer_name.phase {
 		Phase::Plain => match &listener.config {
-			Some(config) => serve_passphrase(conn, volume, config, cache),
+			Some(config) => serve_passphrase(conn, volume, config, cache, declined),
 			None => error!("volume {volume:?}: plain phase, but it is not configured; declining"),
 		},
 		phase => {
@@ -313,12 +333,18 @@ fn handle(conn: OwnedFd, listener: &Listener, cache: &mut Cache) {
 }
 
 /// The plain phase: TPM2 has already failed for this volume.
-fn serve_passphrase(conn: OwnedFd, volume: &str, config: &config::Volume, cache: &mut Cache) {
+fn serve_passphrase(
+	conn: OwnedFd,
+	volume: &str,
+	config: &config::Volume,
+	cache: &mut Cache,
+	declined: &mut consent::Declined,
+) {
 	notice!("volume {volume:?}: plain phase, so every token type has already failed");
 
 	match acquire(volume, config, cache) {
 		Some(secret) => {
-			diagnose(volume, config);
+			maybe_reenroll(volume, config, &secret, declined);
 			reply(conn, volume, &secret)
 		}
 		// Declining hands the prompt back to systemd-cryptsetup, which asks the
@@ -328,96 +354,139 @@ fn serve_passphrase(conn: OwnedFd, volume: &str, config: &config::Volume, cache:
 	}
 }
 
-/// Work out *why* the TPM2 unlock failed, and say so.
+/// Repair the TPM2 binding, if that is the right thing to do and a human agrees.
 ///
-/// DESIGN.md section 4.1's preflight, minus the acting on it: this build reports
-/// its verdict and returns the passphrase regardless. Separating the diagnosis
-/// from the repair is deliberate. Every one of these checks is a reason to
-/// refuse to touch the header, so they are worth watching in a real boot before
-/// anything is wired up to rewrite one.
-fn diagnose(volume: &str, config: &config::Volume) {
-	let device = config.device.as_str();
-
-	let tokens = match token::read(device) {
+/// Synchronous and before the passphrase is returned (DESIGN.md section 4): the
+/// user is already stopped at a console prompt, so the latency is not on an
+/// otherwise-unattended path, and finishing before we reply removes any chance
+/// of the initrd tearing down mid-enrollment.
+///
+/// Every failure here is survivable, which is why none of them stops the boot.
+/// The passphrase slot is never touched, so the worst outcome is a volume that
+/// still needs its passphrase next time -- exactly where it was before we ran.
+fn maybe_reenroll(
+	volume: &str,
+	config: &config::Volume,
+	secret: &Secret,
+	declined: &mut consent::Declined,
+) {
+	let mut tpm = match tpm2::Tpm::open(&config.tpm2_device) {
 		Ok(t) => t,
 		Err(e) => {
-			error!("volume {volume:?}: could not read the LUKS2 tokens ({e})");
+			// No TPM means falling back to a passphrase is the expected state
+			// rather than a fault, and wiping the token would be pure loss.
+			notice!("volume {volume:?}: leaving the header alone: no usable TPM2 device ({e})");
 			return;
 		}
 	};
 
-	if tokens.is_empty() {
-		// "Never enrolled", which section 4.1 keeps distinct from "drifted":
-		// enrolling here would be creating a binding, not repairing one.
+	let plan = match preflight::check(volume, config, &mut tpm) {
+		preflight::Decision::Reenroll(plan) => plan,
+		preflight::Decision::Leave(why) => {
+			notice!("volume {volume:?}: leaving the header alone: {why}");
+			return;
+		}
+	};
+
+	// Section 6 wants every re-enrollment auditable after the fact, which means
+	// saying what the policy was as well as what it is about to become. The PCR
+	// values behind the new digest follow on the next lines.
+	if plan.enrolled.is_empty() {
+		notice!("volume {volume:?}: no TPM2 binding yet, and one can be created");
+	} else {
 		notice!(
-			"volume {volume:?}: carries no systemd-tpm2 token, so there is no TPM2 binding to repair"
+			"volume {volume:?}: the TPM2 binding has gone stale and can be repaired \
+			 (policy {} -> {})",
+			drift::short(&plan.enrolled),
+			drift::short(&plan.state)
+		);
+	}
+	preflight::log_state(volume, &mut tpm, &plan);
+
+	// Section 6: consent is mandatory and has no opt-out. Section 11 asked
+	// whether a refusal should carry across volumes sharing a boot state; it
+	// does, so five volumes bound to the same drifted PCRs ask once.
+	if !plan.state.is_empty() && declined.contains(&plan.state) {
+		notice!(
+			"volume {volume:?}: leaving the header alone: re-enrollment was already declined for this boot state"
 		);
 		return;
 	}
 
-	let mut tpm = match tpm2::Tpm::open(&config.tpm2_device) {
+	if !consent::ask(volume, &config.device) {
+		notice!("volume {volume:?}: leaving the header alone: re-enrollment was declined");
+		if !plan.state.is_empty() {
+			declined.remember(&plan.state);
+		}
+		return;
+	}
+
+	if let Err(e) = enroll::run(
+		&config.device,
+		&config.tpm2_device,
+		&plan.pcrs,
+		plan.bank.as_deref(),
+		secret,
+	) {
+		// systemd-cryptenroll adds the new slot before wiping the old one and
+		// never wipes the slot it just added, so a failure here leaves the old
+		// binding, the new one, or both -- and the passphrase either way.
+		error!("volume {volume:?}: re-enrollment failed ({e}); the volume still unlocks by passphrase");
+		return;
+	}
+
+	verify(volume, config, &plan, &mut tpm);
+}
+
+/// Section 4.3: check the new slot before trusting it.
+///
+/// The old slot is gone by now, so a failure here is worth saying loudly -- but
+/// it is not a disaster, because the passphrase slot was never involved.
+fn verify(volume: &str, config: &config::Volume, plan: &preflight::Plan, tpm: &mut tpm2::Tpm) {
+	let tokens = match token::read(&config.device) {
 		Ok(t) => t,
 		Err(e) => {
-			// No TPM means a passphrase fallback is the expected state rather
-			// than a fault, and wiping the token would be pure loss.
-			notice!("volume {volume:?}: no usable TPM2 device ({e})");
+			error!("volume {volume:?}: re-enrolled, but the header could not be re-read ({e})");
 			return;
 		}
 	};
 
-	match tpm.lockout() {
-		Ok(l) if l.in_lockout => {
-			// Sealing would succeed and unsealing would keep failing, so we
-			// would rewrite the header every boot and fix nothing. Not a case
-			// to recover from -- a TPM in lockout is a bigger problem than a
-			// stale PCR binding.
-			error!(
-				"volume {volume:?}: the TPM is in dictionary-attack lockout ({} of {} failures); refusing to touch the header",
-				l.counter, l.max_auth_fail
-			);
-			return;
-		}
-		Ok(l) => info!(
-			"volume {volume:?}: TPM responsive, lockout counter {} of {}",
-			l.counter, l.max_auth_fail
-		),
-		Err(e) => {
-			error!("volume {volume:?}: could not read the TPM's lockout state ({e})");
-			return;
-		}
-	}
-
-	for t in &tokens {
-		let verdict = drift::check(&mut tpm, t);
-		notice!(
-			"volume {volume:?}: token {}: {}",
-			t.index,
-			verdict.describe()
+	let Some(new) = enroll::find_new_token(&tokens, plan.old_token) else {
+		error!(
+			"volume {volume:?}: re-enrolled, but the new systemd-tpm2 token could not be identified"
 		);
+		return;
+	};
 
-		if let drift::Drift::Drifted { .. } = verdict {
-			log_pcrs(volume, &mut tpm, t);
+	// The real thing first: --token-only refuses to fall back to a passphrase,
+	// so success is a TPM2 unseal and nothing else.
+	match enroll::test_unseal(&config.device, new.index) {
+		Ok(()) => {
+			notice!("volume {volume:?}: re-enrolled as token {} and verified by unsealing it", new.index);
+			return;
 		}
+		Err(e) => info!(
+			"volume {volume:?}: no token-plugin unseal available ({e}); verifying the policy instead"
+		),
 	}
-}
 
-/// The audit line section 6 asks for: what the machine measured at the moment we
-/// were consulted, which is what a re-enrollment would seal against.
-fn log_pcrs(volume: &str, tpm: &mut tpm2::Tpm, t: &token::Tpm2Token) {
-	let bank = t
-		.bank
-		.as_deref()
-		.and_then(tpm2::Bank::from_name)
-		.unwrap_or(tpm2::Bank::SHA256);
-
-	match tpm.read_pcrs(bank, &t.pcrs) {
-		Ok(values) => {
-			for (pcr, digest) in values {
-				let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-				info!("volume {volume:?}: PCR {pcr} is now {hex}");
-			}
-		}
-		Err(e) => warning!("volume {volume:?}: could not read the current PCR values ({e})"),
+	// Reached whenever libcryptsetup cannot load the systemd-tpm2 token plugin:
+	// an initrd trimmed of it, or simply nixpkgs, which ships the plugin in
+	// systemd's output rather than in cryptsetup's plugin directory. Comparing
+	// the sealed policy against the current PCRs is weaker -- it would not
+	// notice an unusable SRK -- but it covers the failure this tool can actually
+	// cause, which is sealing against the wrong state.
+	match drift::check(tpm, new) {
+		Drift::Matches => notice!(
+			"volume {volume:?}: re-enrolled as token {}, and its policy matches the current PCRs",
+			new.index
+		),
+		other => error!(
+			"volume {volume:?}: re-enrolled as token {}, but {}. The passphrase still works; \
+			 re-run systemd-cryptenroll by hand",
+			new.index,
+			other.describe()
+		),
 	}
 }
 

@@ -96,7 +96,7 @@ pub fn check(tpm: &mut Tpm, token: &Tpm2Token) -> Drift {
 
 /// Enough of a digest to tell two apart in a log line, which is all section 6's
 /// audit requirement needs from it.
-fn short(digest: &[u8]) -> String {
+pub fn short(digest: &[u8]) -> String {
 	let mut out = String::with_capacity(16);
 	for b in digest.iter().take(8) {
 		out.push_str(&format!("{b:02x}"));
