@@ -17,15 +17,15 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
-          # The daemon shells out to systemd-ask-password for the prompt and to
-          # cryptsetup to check a passphrase against the volume, so both must be
-          # on PATH. The NixOS module will set it explicitly; this keeps the
-          # package usable on its own.
-          nativeBuildInputs = [ pkgs.makeWrapper ];
-          postInstall = ''
-            wrapProgram $out/bin/tpm2-autoenrolld \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.systemd pkgs.cryptsetup ]}
-          '';
+          # Deliberately unwrapped. The daemon needs systemd-ask-password,
+          # systemd-cryptenroll and cryptsetup on PATH (DESIGN.md section 9),
+          # but baking them in with wrapProgram puts both packages in this
+          # derivation's closure -- and the NixOS module's whole reason for
+          # naming those three binaries individually in the initrd's storePaths
+          # is to avoid copying a second full systemd into the initrd. A wrapper
+          # would silently undo that, so the caller supplies PATH instead: the
+          # module sets it per stage, which is also the only way to pick the
+          # systemd that belongs to the stage being booted.
 
           meta = {
             description = "Re-bind TPM2-enrolled LUKS2 volumes at the point of unlock";
