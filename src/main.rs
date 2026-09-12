@@ -1,4 +1,4 @@
-//! tpm2-autoenrolld -- socket protocol core.
+//! tpm2-autoenrolld -- the plain-phase passphrase path.
 //!
 //! Sits on the `/run/cryptsetup-keys.d/<volume>.key` key-discovery path that
 //! systemd-cryptsetup consults on every iteration of its unlock loop, and
@@ -10,18 +10,26 @@
 //!     empty reply leaves `iovec_is_set(key_data)` false, so the dispatch at
 //!     cryptsetup.c:2044 falls through to the LUKS2 header token and ordinary
 //!     TPM2 unlocking is untouched.
-//!   * plain phase -- prompt for the passphrase and return it verbatim. Being
-//!     asked here at all means every token type has already failed for this
-//!     volume, which is the signal the re-enrollment logic will key off.
+//!   * plain phase -- being asked here at all means every token type has already
+//!     failed for this volume. Answer from the passphrase cache if one of its
+//!     entries opens the volume, otherwise prompt, and in either case return a
+//!     passphrase only once it has been checked against the volume's header.
+//!     We get one attempt before systemd-cryptsetup reverts to prompting the
+//!     user itself (DESIGN.md section 2.3), so a typo is retried here rather
+//!     than spent there.
 //!
 //! What it does not do yet: anything to the LUKS2 header. There is no preflight,
-//! no `systemd-cryptenroll`, no consent prompt. Installing this build changes no
-//! boot outcome, which is precisely what makes the canary test meaningful.
+//! no `systemd-cryptenroll`, no consent prompt. Installing this build still
+//! changes no boot outcome, which is what keeps the canary test meaningful.
 
 mod askpw;
 mod bindname;
+mod cache;
+mod config;
 mod listen_fds;
 mod log;
+mod luks;
+mod memfd;
 mod secret;
 mod volume;
 
@@ -31,25 +39,59 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::event::{PollFd, PollFlags};
 use rustix::net::{SocketAddrAny, SocketAddrUnix};
 
+use crate::askpw::Attempt;
 use crate::bindname::Phase;
+use crate::cache::Cache;
 use crate::log::{error, info, notice, warning};
+use crate::luks::Verdict;
+use crate::secret::Secret;
+
+/// How many times we ask before handing the prompt back to systemd-cryptsetup.
+///
+/// Matches `arg_tries` (cryptsetup.c:87), which is the number of tries a user
+/// gets with us not installed.
+const TRIES: usize = 3;
 
 /// A listening socket together with the volume it serves.
 struct Listener {
 	fd: OwnedFd,
 	volume: String,
+	/// `None` for a volume the config file does not mention. Such a volume
+	/// keeps its listener and declines every connection: not accepting at all
+	/// would leave systemd-cryptsetup waiting on a connection sitting in the
+	/// backlog, which is worse for the boot than falling back to stock
+	/// behaviour.
+	config: Option<config::Volume>,
 }
 
 fn main() -> std::process::ExitCode {
-	if std::env::args().any(|a| a == "--version") {
-		let mut out = std::io::stdout();
-		let _ = writeln!(out, "{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-		return std::process::ExitCode::SUCCESS;
-	}
+	let config_path = match parse_args() {
+		Ok(Some(p)) => p,
+		Ok(None) => return std::process::ExitCode::SUCCESS,
+		Err(e) => {
+			error!("{e}");
+			return std::process::ExitCode::FAILURE;
+		}
+	};
 
 	lock_memory();
 
-	let listeners = match setup() {
+	// A config we cannot read is not a reason to exit. Every volume then
+	// declines, which is the same outcome as not being installed.
+	let config = match config::load(&config_path) {
+		Ok(c) => {
+			if c.is_empty() {
+				warning!("{config_path} configures no volumes; every connection will be declined");
+			}
+			c
+		}
+		Err(e) => {
+			error!("{e}; every connection will be declined");
+			config::Config::default()
+		}
+	};
+
+	let listeners = match setup(&config) {
 		Ok(l) => l,
 		Err(e) => {
 			error!("{e}");
@@ -58,10 +100,39 @@ fn main() -> std::process::ExitCode {
 	};
 
 	for l in &listeners {
-		info!("serving volume {:?}", l.volume);
+		match &l.config {
+			Some(c) => info!("serving volume {:?} on {}", l.volume, c.device),
+			None => error!(
+				"volume {:?} has a socket but no configuration; declining its connections",
+				l.volume
+			),
+		}
 	}
 
 	serve(&listeners)
+}
+
+/// Returns the config path to use, or `None` when the invocation was one that
+/// only prints something.
+fn parse_args() -> Result<Option<String>, String> {
+	let mut path = config::DEFAULT_PATH.to_string();
+
+	for arg in std::env::args().skip(1) {
+		if arg == "--version" {
+			let mut out = std::io::stdout();
+			let _ = writeln!(out, "{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+			return Ok(None);
+		} else if let Some(p) = arg.strip_prefix("--config=") {
+			if p.is_empty() {
+				return Err("--config= needs a path".to_string());
+			}
+			path = p.to_string();
+		} else {
+			return Err(format!("unrecognised argument {arg:?}"));
+		}
+	}
+
+	Ok(Some(path))
 }
 
 /// Pin our pages so key material cannot reach swap.
@@ -82,7 +153,7 @@ fn lock_memory() {
 }
 
 /// Take the listening fds and work out which volume each one serves.
-fn setup() -> Result<Vec<Listener>, String> {
+fn setup(config: &config::Config) -> Result<Vec<Listener>, String> {
 	let fds = listen_fds::take()?;
 
 	let mut listeners = Vec::with_capacity(fds.len());
@@ -96,10 +167,11 @@ fn setup() -> Result<Vec<Listener>, String> {
 		};
 
 		match volume::from_socket_path(&path) {
-			Some(v) => listeners.push(Listener {
-				fd,
-				volume: String::from_utf8_lossy(v).into_owned(),
-			}),
+			Some(v) => {
+				let volume = String::from_utf8_lossy(v).into_owned();
+				let config = config.get(&volume).cloned();
+				listeners.push(Listener { fd, volume, config });
+			}
 			None => error!(
 				"listening socket {:?} is not named <volume>.key; ignoring it",
 				String::from_utf8_lossy(&path)
@@ -131,8 +203,12 @@ fn unix_addr(addr: &SocketAddrAny) -> Option<SocketAddrUnix> {
 ///
 /// Serial handling is a requirement rather than a simplification: several
 /// `systemd-cryptsetup@.service` instances can be unlocking in parallel, and
-/// two console passphrase prompts interleaving would be unusable.
+/// two console passphrase prompts interleaving would be unusable. It is also
+/// what makes the cache worth having -- the second volume's connection is
+/// handled after the first has produced a passphrase, not alongside it.
 fn serve(listeners: &[Listener]) -> std::process::ExitCode {
+	let mut cache = Cache::new();
+
 	loop {
 		let mut polls: Vec<PollFd> = listeners
 			.iter()
@@ -158,7 +234,7 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 		for i in ready {
 			let l = &listeners[i];
 			match rustix::net::accept(&l.fd) {
-				Ok(conn) => handle(conn, &l.volume),
+				Ok(conn) => handle(conn, l, &mut cache),
 				Err(rustix::io::Errno::INTR) | Err(rustix::io::Errno::AGAIN) => {}
 				Err(e) => error!("volume {:?}: accept failed: {e}", l.volume),
 			}
@@ -170,10 +246,13 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 ///
 /// Every path out of here that is not a deliberate reply drops `conn`, which
 /// closes it having written nothing -- the zero-byte decline. That is the
-/// fail-closed default: an unparseable peer name, an unrecognised phase, or a
-/// volume that disagrees with the socket it arrived on all degrade to stock
-/// systemd-cryptsetup behaviour rather than guessing.
-fn handle(conn: OwnedFd, volume: &str) {
+/// fail-closed default: an unparseable peer name, an unrecognised phase, a
+/// volume that disagrees with the socket it arrived on, or a volume we have no
+/// configuration for all degrade to stock systemd-cryptsetup behaviour rather
+/// than guessing.
+fn handle(conn: OwnedFd, listener: &Listener, cache: &mut Cache) {
+	let volume = listener.volume.as_str();
+
 	// `None` means the peer never bound a name of its own. systemd-cryptsetup
 	// always does, so this is not one of its connections.
 	let peer = match rustix::net::getpeername(&conn) {
@@ -217,7 +296,10 @@ fn handle(conn: OwnedFd, volume: &str) {
 	}
 
 	match peer_name.phase {
-		Phase::Plain => serve_passphrase(conn, volume),
+		Phase::Plain => match &listener.config {
+			Some(config) => serve_passphrase(conn, volume, config, cache),
+			None => error!("volume {volume:?}: plain phase, but it is not configured; declining"),
+		},
 		phase => {
 			info!(
 				"volume {volume:?}: {} phase, declining with zero bytes",
@@ -228,20 +310,93 @@ fn handle(conn: OwnedFd, volume: &str) {
 }
 
 /// The plain phase: TPM2 has already failed for this volume.
-fn serve_passphrase(conn: OwnedFd, volume: &str) {
-	notice!("volume {volume:?}: plain phase, so every token type has already failed; prompting");
+fn serve_passphrase(conn: OwnedFd, volume: &str, config: &config::Volume, cache: &mut Cache) {
+	notice!("volume {volume:?}: plain phase, so every token type has already failed");
 
-	let secret = match askpw::ask(volume) {
-		Ok(s) => s,
-		Err(e) => {
-			// Declining hands the prompt back to systemd-cryptsetup, which asks
-			// the user directly. The volume still unlocks.
-			error!("volume {volume:?}: could not acquire a passphrase ({e}); declining");
-			return;
+	match acquire(volume, config, cache) {
+		Some(secret) => reply(conn, volume, &secret),
+		// Declining hands the prompt back to systemd-cryptsetup, which asks the
+		// user directly on its next iteration. The volume still unlocks; we
+		// have simply used up our turn.
+		None => error!("volume {volume:?}: no passphrase to return; declining"),
+	}
+}
+
+/// Produce a passphrase that is known to open `config.device`.
+///
+/// The cache is consulted first (DESIGN.md section 5): with several volumes
+/// sharing a passphrase, only the first of them prompts. Every candidate,
+/// cached or freshly typed, is validated before it is returned -- which is
+/// precisely what makes it safe to accept a secret we did not watch the user
+/// type.
+fn acquire(volume: &str, config: &config::Volume, cache: &mut Cache) -> Option<Secret> {
+	let device = config.device.as_str();
+
+	if !cache.is_empty() {
+		// Worth a line: each trial is a full KDF pass, so this is where a
+		// multi-second pause before the prompt comes from.
+		info!(
+			"volume {volume:?}: trying {} passphrase(s) seen earlier this boot",
+			cache.len()
+		);
+	}
+
+	for cached in cache.iter() {
+		match luks::test_passphrase(device, cached) {
+			Verdict::Correct => {
+				info!("volume {volume:?}: answered from a passphrase seen earlier this boot");
+				return Some(cached.clone());
+			}
+			Verdict::Wrong => {}
+			Verdict::Unusable(why) => {
+				error!("volume {volume:?}: cannot check passphrases against {device} ({why})");
+				return None;
+			}
 		}
-	};
+	}
 
-	// Verbatim: these bytes go straight to crypt_activate_by_passphrase().
+	for attempt in 0..TRIES {
+		let which = if attempt == 0 {
+			Attempt::First
+		} else {
+			Attempt::Retry
+		};
+
+		let candidates = match askpw::ask(volume, device, which) {
+			Ok(c) => c,
+			Err(e) => {
+				error!("volume {volume:?}: could not acquire a passphrase ({e})");
+				return None;
+			}
+		};
+
+		for candidate in candidates {
+			match luks::test_passphrase(device, &candidate) {
+				Verdict::Correct => {
+					cache.insert(candidate.clone());
+					return Some(candidate);
+				}
+				Verdict::Wrong => {}
+				Verdict::Unusable(why) => {
+					error!("volume {volume:?}: cannot check passphrases against {device} ({why})");
+					return None;
+				}
+			}
+		}
+
+		notice!(
+			"volume {volume:?}: passphrase did not unlock {device} (attempt {} of {TRIES})",
+			attempt + 1
+		);
+	}
+
+	None
+}
+
+/// Hand the passphrase back verbatim: these bytes go straight to
+/// `crypt_activate_by_passphrase()`, so a stray newline is a rejected
+/// passphrase.
+fn reply(conn: OwnedFd, volume: &str, secret: &Secret) {
 	match write_all(&conn, secret.as_bytes()) {
 		Ok(()) => info!(
 			"volume {volume:?}: returned a passphrase of {} bytes",

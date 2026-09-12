@@ -1,0 +1,119 @@
+//! Handing a secret to a child process without it appearing anywhere a third
+//! party can read.
+//!
+//! DESIGN.md section 4.2 requires this for `systemd-cryptenroll`: not argv,
+//! which is world-readable in `/proc`, and not the environment, which is
+//! readable for the lifetime of the process by anyone who can read
+//! `/proc/<pid>/environ`. A memfd has no name in any filesystem, is reachable
+//! only through the holder's own `/proc/self/fd`, and disappears when the last
+//! descriptor closes.
+//!
+//! `cryptsetup --key-file=` and `systemd-cryptenroll --unlock-key-file=` both
+//! read the file verbatim -- cryptsetup(8) is explicit that newlines do not
+//! terminate a key file -- so what the child reads is exactly the bytes
+//! systemd-cryptsetup would have received from us.
+
+use std::io::Write;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+
+use crate::secret::Secret;
+
+/// A secret living in an anonymous file, ready to be named to a child.
+pub struct SecretFile {
+	fd: OwnedFd,
+}
+
+impl SecretFile {
+	pub fn new(secret: &Secret) -> Result<Self, String> {
+		let fd = rustix::fs::memfd_create("tpm2-autoenroll-key", rustix::fs::MemfdFlags::CLOEXEC)
+			.map_err(|e| format!("memfd_create: {e}"))?;
+
+		let mut file = std::fs::File::from(fd);
+		file.write_all(secret.as_bytes())
+			.map_err(|e| format!("writing the key to a memfd: {e}"))?;
+		file.flush()
+			.map_err(|e| format!("flushing the key to a memfd: {e}"))?;
+
+		Ok(SecretFile { fd: file.into() })
+	}
+
+	/// The path to hand the child.
+	///
+	/// `/proc/self/fd/<n>` resolves in the *child's* fd table, which is why
+	/// [`Self::attach`] has to run first: the number is ours, and it only
+	/// survives the exec because we clear `FD_CLOEXEC` on it after the fork.
+	/// Opening the link re-opens the memfd at offset zero, so the same
+	/// `SecretFile` can be handed to several children in turn.
+	pub fn path(&self) -> String {
+		format!("/proc/self/fd/{}", self.fd.as_raw_fd())
+	}
+
+	/// Arrange for this fd to survive `exec` in `cmd`, and only in `cmd`.
+	///
+	/// Clearing `FD_CLOEXEC` in the parent would leak the key into every
+	/// subsequent child, including `systemd-ask-password`. Doing it in the
+	/// pre-exec hook confines it to this one process.
+	pub fn attach(&self, cmd: &mut Command) {
+		let raw = self.fd.as_raw_fd();
+		// SAFETY: the closure runs in the forked child between fork and exec,
+		// where only async-signal-safe calls are permitted. fcntl is one, and
+		// it allocates nothing.
+		unsafe {
+			cmd.pre_exec(move || {
+				if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
+					return Err(std::io::Error::last_os_error());
+				}
+				Ok(())
+			});
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn the_path_reads_back_the_secret() {
+		// Within our own process /proc/self/fd is our fd table, so this is the
+		// same read the child performs.
+		let secret = Secret::new(b"correct-horse".to_vec());
+		let file = SecretFile::new(&secret).expect("SecretFile::new returned Err, expected Ok");
+		let actual = std::fs::read(file.path()).expect("reading the memfd path returned Err");
+		assert_eq!(
+			actual,
+			b"correct-horse",
+			"std::fs::read(SecretFile::new(b\"correct-horse\").path()) returned {actual:?}, expected b\"correct-horse\""
+		);
+	}
+
+	#[test]
+	fn reading_twice_gives_the_same_bytes() {
+		// Each open of the procfs link starts at offset zero. If it did not,
+		// the second child to be handed the same SecretFile would read nothing
+		// and report a wrong passphrase.
+		let secret = Secret::new(b"hunter2".to_vec());
+		let file = SecretFile::new(&secret).expect("SecretFile::new returned Err, expected Ok");
+		let _ = std::fs::read(file.path()).expect("the first read returned Err");
+		let actual = std::fs::read(file.path()).expect("the second read returned Err");
+		assert_eq!(
+			actual,
+			b"hunter2",
+			"the second std::fs::read of the same SecretFile path returned {actual:?}, expected b\"hunter2\""
+		);
+	}
+
+	#[test]
+	fn keeps_bytes_that_are_not_text() {
+		let secret = Secret::new(b"\xff\x00\npass".to_vec());
+		let file = SecretFile::new(&secret).expect("SecretFile::new returned Err, expected Ok");
+		let actual = std::fs::read(file.path()).expect("reading the memfd path returned Err");
+		assert_eq!(
+			actual,
+			b"\xff\x00\npass",
+			"std::fs::read of a SecretFile holding b\"\\xff\\x00\\npass\" returned {actual:?}, expected the same bytes verbatim"
+		);
+	}
+}

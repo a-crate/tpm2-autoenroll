@@ -40,6 +40,25 @@ impl Drop for Secret {
 	}
 }
 
+/// Written out rather than derived, because `Drop` rules a derive out anyway and
+/// because copying a secret should be a visible act.
+impl Clone for Secret {
+	fn clone(&self) -> Self {
+		Secret(self.0.clone())
+	}
+}
+
+/// Used only to keep the in-process cache free of duplicates. Plain byte
+/// equality: both operands are already in this process's address space, held by
+/// a root daemon, so a constant-time comparison would protect against nothing.
+impl PartialEq for Secret {
+	fn eq(&self, other: &Self) -> bool {
+		self.0 == other.0
+	}
+}
+
+impl Eq for Secret {}
+
 /// Renders as a redaction, so a `Secret` reached by an accidental `{:?}` on some
 /// enclosing struct cannot leak the passphrase into the journal.
 impl fmt::Debug for Secret {

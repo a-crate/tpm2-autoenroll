@@ -17,13 +17,14 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
-          # The daemon shells out to systemd-ask-password, which must be on
-          # PATH. The NixOS module will set it explicitly; this keeps the
+          # The daemon shells out to systemd-ask-password for the prompt and to
+          # cryptsetup to check a passphrase against the volume, so both must be
+          # on PATH. The NixOS module will set it explicitly; this keeps the
           # package usable on its own.
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postInstall = ''
             wrapProgram $out/bin/tpm2-autoenrolld \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.systemd ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.systemd pkgs.cryptsetup ]}
           '';
 
           meta = {

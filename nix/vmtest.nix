@@ -5,7 +5,7 @@
 # `iovec_is_set(key_data)` false, so the dispatch at cryptsetup.c:2044 falls
 # through to the LUKS2 header token and ordinary TPM2 unlocking still works.
 #
-# Two assertions, in order of importance:
+# Assertions, in order of importance:
 #
 #   1. With the daemon's socket installed and the PCR policy satisfied, the
 #      volume unlocks silently. If this breaks, every managed volume prompts on
@@ -13,23 +13,46 @@
 #      run first against any new systemd.
 #   2. With the policy broken, the daemon is reached in the plain phase and the
 #      passphrase it returns activates the volume.
+#   3. A wrong passphrase is retried by the daemon rather than handed to
+#      systemd-cryptsetup, which would spend the one attempt we get (2.3).
+#   4. A second volume sharing the passphrase is answered from the daemon's
+#      cache without a second prompt (section 5).
 #
 # PCR 16 is the debug PCR: extendable from userspace, which lets us manufacture
 # the policy mismatch in place. No reboot and no boot loader, so the test is
-# fast enough to gate CI. The volume is unlocked from the booted system rather
+# fast enough to gate CI. The volumes are unlocked from the booted system rather
 # than the initrd, which section 9.1 says is the same code path.
 { pkgs, tpm2-autoenrolld }:
 
 let
   passphrase = "correct-horse-battery-staple";
-  volume = "autotest";
-  device = "/dev/vdb";
+  wrongPassphrase = "not-the-passphrase";
+
+  volumes = {
+    autotest = "/dev/vdb";
+    autotest2 = "/dev/vdc";
+  };
+
+  daemonConfig = {
+    volumes = builtins.mapAttrs
+      (_: device: {
+        inherit device;
+        tpm2Device = "auto";
+        tpm2Pcrs = [ 16 ];
+        enrollIfAbsent = false;
+      })
+      volumes;
+  };
 
   # A minimal password agent, which is all the test needs to stand in for
   # plymouth or the console agent. systemd's protocol is: read Socket= out of
   # /run/systemd/ask-password/ask.*, then send "+" followed by the password as a
   # datagram. This is what a real agent does, so nothing here is a hook into the
   # daemon.
+  #
+  # It takes a sequence of answers and spends one per *distinct* request, which
+  # is what lets a test say "answer wrong, then right" and assert that the
+  # daemon asked twice.
   answerPassphrase = pkgs.writeScriptBin "answer-passphrase" ''
     #!${pkgs.python3}/bin/python3
     import glob
@@ -38,8 +61,10 @@ let
     import sys
     import time
 
-    PASSPHRASE = ${builtins.toJSON passphrase}
-    DEADLINE = time.monotonic() + 60
+    ANSWERS = sys.argv[1:]
+    if not ANSWERS:
+        print("usage: answer-passphrase ANSWER [ANSWER...]", file=sys.stderr)
+        sys.exit(2)
 
 
     def reply_socket(ask_file):
@@ -53,23 +78,38 @@ let
         return None
 
 
-    while time.monotonic() < DEADLINE:
-        for ask_file in glob.glob("/run/systemd/ask-password/ask.*"):
-            path = reply_socket(ask_file)
-            if not path or not os.path.exists(path):
-                continue
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            try:
-                sock.connect(path)
-                sock.send(b"+" + PASSPHRASE.encode())
-            finally:
-                sock.close()
-            print("answered " + ask_file)
-            sys.exit(0)
-        time.sleep(0.1)
+    def answer_one(answer, already):
+        """Spend one answer on the first request we have not already answered."""
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            for ask_file in sorted(glob.glob("/run/systemd/ask-password/ask.*")):
+                if ask_file in already:
+                    continue
+                path = reply_socket(ask_file)
+                if not path or not os.path.exists(path):
+                    continue
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                try:
+                    sock.connect(path)
+                    sock.send(b"+" + answer.encode())
+                finally:
+                    sock.close()
+                already.add(ask_file)
+                print("answered " + ask_file)
+                return True
+            time.sleep(0.1)
+        return False
 
-    print("no password request appeared within 60s", file=sys.stderr)
-    sys.exit(1)
+
+    answered = set()
+    for index, answer in enumerate(ANSWERS):
+        if not answer_one(answer, answered):
+            print(
+                f"request {index + 1} of {len(ANSWERS)} did not appear within 60s",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    sys.exit(0)
   '';
 in
 pkgs.testers.runNixOSTest {
@@ -77,7 +117,7 @@ pkgs.testers.runNixOSTest {
 
   nodes.machine = { lib, pkgs, ... }: {
     virtualisation.tpm.enable = true;
-    virtualisation.emptyDiskImages = [ 512 ];
+    virtualisation.emptyDiskImages = [ 512 512 ];
     virtualisation.memorySize = 2048;
 
     environment.systemPackages = [
@@ -93,9 +133,18 @@ pkgs.testers.runNixOSTest {
     # and the header token would never be read -- DESIGN.md section 2.2.
     #
     # noauto keeps the unlock under the test's control rather than boot ordering.
-    environment.etc.crypttab.text = ''
-      ${volume} ${device} - noauto,tpm2-device=auto
-    '';
+    environment.etc.crypttab.text =
+      lib.concatMapStrings
+        (line: line + "\n")
+        (lib.mapAttrsToList
+          (volume: device: "${volume} ${device} - noauto,tpm2-device=auto")
+          volumes);
+
+    # The daemon's own configuration: which volumes it may act on, and the
+    # backing device behind each (DESIGN.md section 7.1). Without an entry a
+    # volume's connections are declined, so this file is what turns the socket
+    # from inert into useful.
+    environment.etc."tpm2-autoenroll/config.json".text = builtins.toJSON daemonConfig;
 
     systemd.tmpfiles.rules = [
       "d /run/cryptsetup-keys.d 0700 root root -"
@@ -107,7 +156,9 @@ pkgs.testers.runNixOSTest {
       before = [ "cryptsetup-pre.target" ];
       unitConfig.DefaultDependencies = "no";
       socketConfig = {
-        ListenStream = "/run/cryptsetup-keys.d/${volume}.key";
+        ListenStream = lib.mapAttrsToList
+          (volume: _: "/run/cryptsetup-keys.d/${volume}.key")
+          volumes;
         Accept = "no";
         SocketMode = "0600";
       };
@@ -141,9 +192,13 @@ pkgs.testers.runNixOSTest {
     import re
 
     PASSPHRASE = ${builtins.toJSON passphrase}
-    VOLUME = ${builtins.toJSON volume}
-    DEVICE = ${builtins.toJSON device}
+    WRONG = ${builtins.toJSON wrongPassphrase}
+    VOLUME = "autotest"
+    DEVICE = "/dev/vdb"
+    VOLUME2 = "autotest2"
+    DEVICE2 = "/dev/vdc"
     UNIT = f"systemd-cryptsetup@{VOLUME}.service"
+    UNIT2 = f"systemd-cryptsetup@{VOLUME2}.service"
     CRYPTENROLL = "${pkgs.systemd}/bin/systemd-cryptenroll"
     DROPIN_DIR = f"/run/systemd/system/{UNIT}.d"
 
@@ -166,14 +221,30 @@ pkgs.testers.runNixOSTest {
             return "\n".join(daemon_log_lines()[self.mark:])
 
 
-    def header_digest():
-        return machine.succeed(f"cryptsetup luksDump {DEVICE} | sha256sum").split()[0]
+    def header_digest(device):
+        return machine.succeed(f"cryptsetup luksDump {device} | sha256sum").split()[0]
 
 
     def pending_password_requests():
         return machine.succeed(
             "ls /run/systemd/ask-password/ 2>/dev/null | grep '^ask\\.' || true"
         ).strip()
+
+
+    def format_and_enroll(device):
+        # pbkdf2 with few iterations: argon2id would spend seconds and a
+        # gigabyte per unlock, and the KDF is not what is under test here.
+        # The daemon adds a KDF pass of its own for validation, so this keeps
+        # the whole test cheap rather than only the unlock.
+        machine.succeed(
+            f"echo -n {PASSPHRASE} | cryptsetup luksFormat --type luks2 "
+            f"--pbkdf pbkdf2 --pbkdf-force-iterations 1000 --batch-mode {device} -"
+        )
+        machine.succeed(
+            f"PASSWORD={PASSPHRASE} {CRYPTENROLL} "
+            f"--tpm2-device=auto --tpm2-pcrs=16 {device}"
+        )
+        machine.succeed(f"cryptsetup luksDump {device} | grep -q systemd-tpm2")
 
 
     def set_token_plugin(enabled):
@@ -192,19 +263,13 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_file("/dev/tpmrm0")
     machine.wait_for_unit("tpm2-autoenrolld.socket")
     machine.succeed(f"test -S /run/cryptsetup-keys.d/{VOLUME}.key")
+    machine.succeed(f"test -S /run/cryptsetup-keys.d/{VOLUME2}.key")
 
-    with subtest("a LUKS2 volume bound to PCR 16"):
-        # pbkdf2 with few iterations: argon2id would spend seconds and a
-        # gigabyte per unlock, and the KDF is not what is under test here.
-        machine.succeed(
-            f"echo -n {PASSPHRASE} | cryptsetup luksFormat --type luks2 "
-            f"--pbkdf pbkdf2 --pbkdf-force-iterations 1000 --batch-mode {DEVICE} -"
-        )
-        machine.succeed(
-            f"PASSWORD={PASSPHRASE} {CRYPTENROLL} "
-            f"--tpm2-device=auto --tpm2-pcrs=16 {DEVICE}"
-        )
-        machine.succeed(f"cryptsetup luksDump {DEVICE} | grep -q systemd-tpm2")
+    with subtest("two LUKS2 volumes bound to PCR 16, sharing a passphrase"):
+        # Both are enrolled before PCR 16 is touched, so both seal against the
+        # same value and both go stale at the same moment.
+        format_and_enroll(DEVICE)
+        format_and_enroll(DEVICE2)
 
     with subtest("token plugin route: our socket does not disturb a healthy unlock"):
         set_token_plugin(True)
@@ -258,19 +323,22 @@ pkgs.testers.runNixOSTest {
         )
         machine.succeed(f"systemctl stop {UNIT}")
 
-    with subtest("a broken policy reaches us in the plain phase"):
+    with subtest("a broken policy reaches us in the plain phase, and a typo is retried"):
         # Back to the configuration a real machine runs.
         set_token_plugin(True)
-        before = header_digest()
+        before = header_digest(DEVICE)
 
-        # Extend PCR 16 so the sealed policy no longer matches.
+        # Extend PCR 16 so the sealed policy no longer matches, for both volumes.
         machine.succeed(
             "tpm2_pcrextend 16:sha256=$(head -c32 /dev/zero | sha256sum | cut -d' ' -f1)"
         )
 
         watch = LogWatch()
         machine.succeed(f"systemctl start --no-block {UNIT}")
-        machine.succeed("answer-passphrase")
+        # The wrong answer must be rejected by us, not by systemd-cryptsetup:
+        # section 2.3 gives us exactly one attempt, and handing back a typo
+        # would spend it.
+        machine.succeed(f"answer-passphrase {WRONG} {PASSPHRASE}")
         machine.wait_for_unit(UNIT)
         machine.succeed(f"test -b /dev/mapper/{VOLUME}")
 
@@ -280,20 +348,69 @@ pkgs.testers.runNixOSTest {
             "expected a 'plain phase' line, meaning systemd-cryptsetup fell "
             "back to us for the real passphrase"
         )
-        assert re.search(r"returned a passphrase of \d+ bytes", log), (
-            f"after answering the prompt the new daemon output was:\n{log}\n"
-            "expected a 'returned a passphrase of N bytes' line"
+        assert re.search(r"passphrase did not unlock .* \(attempt 1 of 3\)", log), (
+            f"after answering with a wrong passphrase the new daemon output was:\n{log}\n"
+            "expected an 'attempt 1 of 3' line, meaning the wrong passphrase "
+            "was caught by validation and re-asked here rather than returned"
+        )
+        returned = re.findall(r"returned a passphrase of \d+ bytes", log)
+        assert len(returned) == 1, (
+            f"the new daemon output was:\n{log}\n"
+            f"expected exactly one 'returned a passphrase of N bytes' line, got {len(returned)}: "
+            "only the validated passphrase may be handed to systemd-cryptsetup"
         )
 
-        after = header_digest()
+        after = header_digest(DEVICE)
         assert before == after, (
             f"cryptsetup luksDump {DEVICE} digest was {before} before the "
             f"fallback unlock and {after} after, expected them to be equal: "
             "this slice must not touch the LUKS header"
         )
 
-    with subtest("the volume is usable"):
+    with subtest("a second volume is answered from cache without a second prompt"):
+        # DESIGN.md section 5: discovery preempts systemd's keyring cache, so
+        # every managed volume asks us first. Remembering the passphrase in
+        # process is what keeps the user typing once.
+        before = header_digest(DEVICE2)
+        watch = LogWatch()
+
+        machine.succeed(f"systemctl start {UNIT2}")
+        machine.succeed(f"test -b /dev/mapper/{VOLUME2}")
+
+        log = watch.new()
+        assert "answered from a passphrase seen earlier this boot" in log, (
+            f"unlocking the second volume produced:\n{log}\n"
+            "expected an 'answered from a passphrase seen earlier this boot' "
+            "line, meaning the in-process cache covered it"
+        )
+        pending = pending_password_requests()
+        assert pending == "", (
+            f"pending_password_requests() returned {pending!r}, expected an "
+            "empty string: the second volume must not prompt again"
+        )
+
+        after = header_digest(DEVICE2)
+        assert before == after, (
+            f"cryptsetup luksDump {DEVICE2} digest was {before} before the "
+            f"fallback unlock and {after} after, expected them to be equal"
+        )
+
+    with subtest("both sockets were matched to their configuration at startup"):
+        # A socket with no config entry has no backing device to validate
+        # against, so it declines everything. That the daemon paired each
+        # listener with the right device is what the rest of this test has been
+        # relying on.
+        log = "\n".join(daemon_log_lines())
+        for volume, device in ((VOLUME, DEVICE), (VOLUME2, DEVICE2)):
+            expected = f'serving volume "{volume}" on {device}'
+            assert expected in log, (
+                f"the daemon output was:\n{log}\n"
+                f"expected a {expected!r} line at startup"
+            )
+
+    with subtest("the volumes are usable"):
         machine.succeed(f"mkfs.ext4 /dev/mapper/{VOLUME}")
-        machine.succeed(f"systemctl stop {UNIT}")
+        machine.succeed(f"mkfs.ext4 /dev/mapper/{VOLUME2}")
+        machine.succeed(f"systemctl stop {UNIT} {UNIT2}")
   '';
 }

@@ -1,0 +1,3 @@
+# The house style is tabs (see the global coding standards); without this,
+# cargo fmt would rewrite every file to spaces and disagree with the tree.
+hard_tabs = true

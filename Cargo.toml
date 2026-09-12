@@ -12,6 +12,9 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2"
 rustix = { version = "1", features = ["net", "event", "process", "fs"] }
+# Value-walking only, so serde_derive and its proc-macro chain stay out of the
+# build: the config file is small, read once, and never written.
+serde_json = { version = "1", default-features = false, features = ["std"] }
 zeroize = "1"
 
 [profile.release]
