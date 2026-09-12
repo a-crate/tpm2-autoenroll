@@ -31,6 +31,7 @@ let
   volumes = {
     autotest = "/dev/vdb";
     autotest2 = "/dev/vdc";
+    autotest3 = "/dev/vdd";
   };
 
   daemonConfig = {
@@ -117,7 +118,7 @@ pkgs.testers.runNixOSTest {
 
   nodes.machine = { lib, pkgs, ... }: {
     virtualisation.tpm.enable = true;
-    virtualisation.emptyDiskImages = [ 512 512 ];
+    virtualisation.emptyDiskImages = [ 512 512 512 ];
     virtualisation.memorySize = 2048;
 
     environment.systemPackages = [
@@ -196,9 +197,12 @@ pkgs.testers.runNixOSTest {
     VOLUME = "autotest"
     DEVICE = "/dev/vdb"
     VOLUME2 = "autotest2"
+    VOLUME3 = "autotest3"
     DEVICE2 = "/dev/vdc"
+    DEVICE3 = "/dev/vdd"
     UNIT = f"systemd-cryptsetup@{VOLUME}.service"
     UNIT2 = f"systemd-cryptsetup@{VOLUME2}.service"
+    UNIT3 = f"systemd-cryptsetup@{VOLUME3}.service"
     CRYPTENROLL = "${pkgs.systemd}/bin/systemd-cryptenroll"
     DROPIN_DIR = f"/run/systemd/system/{UNIT}.d"
 
@@ -245,6 +249,39 @@ pkgs.testers.runNixOSTest {
             f"--tpm2-device=auto --tpm2-pcrs=16 {device}"
         )
         machine.succeed(f"cryptsetup luksDump {device} | grep -q systemd-tpm2")
+
+
+    def mangle_token_blob(device):
+        """Break unsealing without touching the policy or the PCRs.
+
+        The sealed blob is what the TPM hands back a key from; replacing it with
+        something that is still valid base64 but is not a TPM object makes every
+        unseal attempt fail, while tpm2-policy-hash -- the thing the daemon
+        compares against -- stays exactly as enrolled."""
+        import json
+
+        token = json.loads(
+            machine.succeed(f"cryptsetup token export --token-id 0 {device}")
+        )
+
+        def flatten(value):
+            # systemd writes this either as one base64 string or as an array of
+            # them (key sharding); both spellings are live.
+            core = value.rstrip("=")
+            return "A" * len(core) + value[len(core):]
+
+        blob = token["tpm2-blob"]
+        token["tpm2-blob"] = (
+            [flatten(b) for b in blob] if isinstance(blob, list) else flatten(blob)
+        )
+
+        machine.succeed(f"cryptsetup token remove --token-id 0 {device}")
+        machine.succeed(
+            f"cat > /tmp/token.json <<'EOF'\n{json.dumps(token)}\nEOF"
+        )
+        machine.succeed(
+            f"cryptsetup token import --token-id 0 --json-file /tmp/token.json {device}"
+        )
 
 
     def set_token_plugin(enabled):
@@ -393,6 +430,100 @@ pkgs.testers.runNixOSTest {
         assert before == after, (
             f"cryptsetup luksDump {DEVICE2} digest was {before} before the "
             f"fallback unlock and {after} after, expected them to be equal"
+        )
+
+    with subtest("the drift verdict names the change in boot measurements"):
+        # The daemon was consulted for autotest and autotest2 after PCR 16 was
+        # extended out from under their policies, so both must read as drifted
+        # -- and the audit line section 6 asks for must name the PCR value that
+        # a re-enrollment would seal against.
+        log = "\n".join(daemon_log_lines())
+        for volume in (VOLUME, VOLUME2):
+            expected = f'volume "{volume}": token 0: the boot measurements have changed'
+            assert expected in log, (
+                f"the daemon output was:\n{log}\n"
+                f"expected a {expected!r} line: PCR 16 was extended after "
+                "enrollment, so the sealed policy can no longer be satisfied"
+            )
+        assert re.search(r'PCR 16 is now [0-9a-f]{64}', log), (
+            f"the daemon output was:\n{log}\n"
+            "expected a 'PCR 16 is now <sha256>' line recording the state a "
+            "re-enrollment would capture"
+        )
+        assert "lockout counter 0 of" in log, (
+            f"the daemon output was:\n{log}\n"
+            "expected a 'lockout counter 0 of N' line: a healthy swtpm is not "
+            "in dictionary-attack lockout, and reading that is also how the "
+            "daemon establishes the TPM answers at all"
+        )
+
+    with subtest("a failure that is not drift is not reported as drift"):
+        # The pathological case section 4.1's last check exists for: the volume
+        # falls back to a passphrase while its sealed policy still matches the
+        # PCRs exactly. Re-sealing the very same policy would leave the next
+        # boot failing the same way, so the daemon must not read this as drift.
+        #
+        # Manufactured by mangling the token's sealed blob, which makes
+        # unsealing fail while leaving tpm2-policy-hash and the PCRs alone.
+        # (A mangled blob would in fact be repaired by re-enrolling; the check
+        # is deliberately conservative and cannot tell that case apart from one
+        # where re-sealing changes nothing. Declining costs a manual repair,
+        # guessing costs a header rewrite on every boot.)
+        #
+        # It doubles as the proof that the daemon's trial-session digest really
+        # does reproduce what systemd-cryptenroll sealed: the two digests were
+        # computed by different code from different directions, and the
+        # assertion is that they come out equal.
+        format_and_enroll(DEVICE3)
+        mangle_token_blob(DEVICE3)
+        before = header_digest(DEVICE3)
+        watch = LogWatch()
+
+        machine.succeed(f"systemctl start {UNIT3}")
+        machine.succeed(f"test -b /dev/mapper/{VOLUME3}")
+
+        log = watch.new()
+        assert "plain phase" in log, (
+            f"unlocking autotest3 produced:\n{log}\n"
+            "expected a 'plain phase' line: with tpm2-device pointing at a "
+            "device that does not exist, systemd-cryptsetup must fall back to us"
+        )
+        expected = "the current PCRs still satisfy the enrolled policy"
+        assert expected in log, (
+            f"unlocking autotest3 produced:\n{log}\n"
+            f"expected a {expected!r} line. Its absence means the policy digest "
+            "the daemon computed in a TPM trial session does not match the one "
+            "systemd-cryptenroll sealed with, for a volume whose PCRs have not "
+            "moved at all"
+        )
+        assert "the boot measurements have changed" not in log, (
+            f"unlocking autotest3 produced:\n{log}\n"
+            "expected no drift line: this volume's PCRs are exactly what it was "
+            "enrolled against"
+        )
+
+        after = header_digest(DEVICE3)
+        assert before == after, (
+            f"cryptsetup luksDump {DEVICE3} digest was {before} before and "
+            f"{after} after, expected them to be equal"
+        )
+
+    with subtest("a volume with no TPM2 token is left alone"):
+        # "Never enrolled" rather than "drifted". Re-enrolling here would be
+        # creating a binding the user never asked for, which is what
+        # enrollIfAbsent exists to gate.
+        machine.succeed(f"systemctl stop {UNIT3}")
+        machine.succeed(f"{CRYPTENROLL} --wipe-slot=tpm2 {DEVICE3}")
+        watch = LogWatch()
+
+        machine.succeed(f"systemctl start {UNIT3}")
+        machine.succeed(f"test -b /dev/mapper/{VOLUME3}")
+
+        log = watch.new()
+        expected = "carries no systemd-tpm2 token, so there is no TPM2 binding to repair"
+        assert expected in log, (
+            f"unlocking a volume with its TPM2 token wiped produced:\n{log}\n"
+            f"expected a {expected!r} line"
         )
 
     with subtest("both sockets were matched to their configuration at startup"):

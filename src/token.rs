@@ -1,0 +1,354 @@
+//! Reading the `systemd-tpm2` token out of a LUKS2 header.
+//!
+//! This is where the enrollment's own parameters live: which PCRs it was sealed
+//! against, in which bank, and the policy digest that sealing produced. Nothing
+//! else knows them -- the daemon's config says which PCRs we would enroll
+//! *next* time, which is a different question from what is on the disk now.
+//!
+//! Obtained from `cryptsetup luksDump --dump-json-metadata`, whose output is the
+//! header's JSON verbatim. The field names below are systemd's, from
+//! `tpm2_make_luks2_json()` in src/shared/tpm2-util.c. As the comment there
+//! admits, the older fields use `-` and the newer ones `_`; both spellings are
+//! live, so both appear here.
+
+use std::process::{Command, Stdio};
+
+use serde_json::Value;
+
+const BINARY: &str = "cryptsetup";
+
+/// A `systemd-tpm2` token as it sits in the header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tpm2Token {
+	/// The token's index in the header, which is what `--wipe-slot=` and any
+	/// later diffing need.
+	pub index: u32,
+	/// PCR indices the policy covers. May be empty: an enrollment against no
+	/// PCRs at all is legal and unlocks unconditionally.
+	pub pcrs: Vec<u8>,
+	/// The bank name, e.g. `sha256`. Absent in very old enrollments.
+	pub bank: Option<String>,
+	/// The sealed policy digest, which is what a drift check compares against.
+	pub policy_hash: Vec<u8>,
+	/// Whether unsealing additionally requires a PIN.
+	pub pin: bool,
+	/// A signed-PCR-policy or pcrlock enrollment. We can neither judge nor
+	/// reproduce these, and must not wipe them.
+	pub advanced: Option<&'static str>,
+}
+
+/// Every `systemd-tpm2` token in `device`'s header, in header order.
+pub fn read(device: &str) -> Result<Vec<Tpm2Token>, String> {
+	let out = Command::new(BINARY)
+		.arg("luksDump")
+		.arg("--dump-json-metadata")
+		.arg(device)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.output()
+		.map_err(|e| format!("could not run {BINARY}: {e}"))?;
+
+	if !out.status.success() {
+		let stderr = String::from_utf8_lossy(&out.stderr);
+		return Err(format!(
+			"{BINARY} luksDump {device} exited with {} ({})",
+			out.status,
+			stderr.trim()
+		));
+	}
+
+	parse(&String::from_utf8_lossy(&out.stdout))
+}
+
+pub fn parse(json: &str) -> Result<Vec<Tpm2Token>, String> {
+	let root: Value = serde_json::from_str(json).map_err(|e| format!("not valid JSON: {e}"))?;
+
+	// A header with no tokens at all omits the object entirely.
+	let Some(tokens) = root.get("tokens").and_then(Value::as_object) else {
+		return Ok(Vec::new());
+	};
+
+	let mut out = Vec::new();
+	for (index, value) in tokens {
+		if value.get("type").and_then(Value::as_str) != Some("systemd-tpm2") {
+			continue;
+		}
+		let index: u32 = index
+			.parse()
+			.map_err(|_| format!("token key {index:?} is not a number"))?;
+		out.push(token(index, value)?);
+	}
+
+	out.sort_by_key(|t| t.index);
+	Ok(out)
+}
+
+fn token(index: u32, value: &Value) -> Result<Tpm2Token, String> {
+	let pcrs = match value.get("tpm2-pcrs") {
+		Some(v) => pcr_list(v)?,
+		None => Vec::new(),
+	};
+
+	let bank = value
+		.get("tpm2-pcr-bank")
+		.and_then(Value::as_str)
+		.map(str::to_string);
+
+	let policy_hash = match value.get("tpm2-policy-hash") {
+		Some(v) => single_shard(v, "tpm2-policy-hash")?,
+		None => return Err(format!("token {index} has no \"tpm2-policy-hash\"")),
+	};
+
+	// systemd writes these only when true.
+	let pin = value
+		.get("tpm2-pin")
+		.and_then(Value::as_bool)
+		.unwrap_or(false);
+
+	// Both of these change how the policy is built, in ways a PCR trial session
+	// cannot reproduce: a signed policy authorizes over a public key, and
+	// pcrlock authorizes against an NV index. Recognising them is how we avoid
+	// mistaking "we cannot compute this" for "the PCRs drifted".
+	let advanced = if value.get("tpm2_pubkey").is_some() || value.get("tpm2_pubkey_pcrs").is_some() {
+		Some("a signed PCR policy")
+	} else if value.get("tpm2_pcrlock").and_then(Value::as_bool) == Some(true) {
+		Some("a pcrlock policy")
+	} else {
+		None
+	};
+
+	Ok(Tpm2Token {
+		index,
+		pcrs,
+		bank,
+		policy_hash,
+		pin,
+		advanced,
+	})
+}
+
+fn pcr_list(value: &Value) -> Result<Vec<u8>, String> {
+	let list = value
+		.as_array()
+		.ok_or("\"tpm2-pcrs\" is not an array")?;
+	let mut out = Vec::with_capacity(list.len());
+	for item in list {
+		let n = item.as_u64().ok_or("\"tpm2-pcrs\" contains a non-integer")?;
+		if n > 23 {
+			return Err(format!("\"tpm2-pcrs\" contains {n}, which is not a PCR index"));
+		}
+		out.push(n as u8);
+	}
+	out.sort_unstable();
+	Ok(out)
+}
+
+/// A field systemd writes either as a hex string or as an array of them.
+///
+/// The array form is key sharding, where several policies each protect part of
+/// the key. We have no business rewriting one of several shards, so more than
+/// one is reported as an error rather than silently taking the first.
+fn single_shard(value: &Value, field: &str) -> Result<Vec<u8>, String> {
+	let text = match value {
+		Value::String(s) => s.as_str(),
+		Value::Array(items) => match items.len() {
+			1 => items[0]
+				.as_str()
+				.ok_or_else(|| format!("{field:?} contains a non-string"))?,
+			n => return Err(format!("{field:?} has {n} shards; only one is supported")),
+		},
+		_ => return Err(format!("{field:?} is neither a string nor an array")),
+	};
+	unhex(text).ok_or_else(|| format!("{field:?} is not valid hex"))
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+	if !text.len().is_multiple_of(2) {
+		return None;
+	}
+	let bytes = text.as_bytes();
+	let mut out = Vec::with_capacity(text.len() / 2);
+	for pair in bytes.chunks(2) {
+		let hi = (pair[0] as char).to_digit(16)?;
+		let lo = (pair[1] as char).to_digit(16)?;
+		out.push((hi * 16 + lo) as u8);
+	}
+	Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const ENROLLED: &str = r#"{
+	  "keyslots": {"0": {"type": "luks2"}},
+	  "tokens": {
+	    "0": {
+	      "type": "systemd-tpm2",
+	      "keyslots": ["1"],
+	      "tpm2-blob": "Zm9v",
+	      "tpm2-pcrs": [7, 11],
+	      "tpm2-pcr-bank": "sha256",
+	      "tpm2-primary-alg": "ecc",
+	      "tpm2-policy-hash": "abcdef0123456789"
+	    }
+	  }
+	}"#;
+
+	fn only(json: &str) -> Tpm2Token {
+		let tokens = parse(json).expect("parse returned Err, expected Ok");
+		assert_eq!(
+			tokens.len(),
+			1,
+			"parse(<one systemd-tpm2 token>) returned {} tokens, expected 1",
+			tokens.len()
+		);
+		tokens.into_iter().next().unwrap()
+	}
+
+	#[test]
+	fn reads_an_ordinary_enrollment() {
+		let expected = Tpm2Token {
+			index: 0,
+			pcrs: vec![7, 11],
+			bank: Some("sha256".to_string()),
+			policy_hash: vec![0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89],
+			pin: false,
+			advanced: None,
+		};
+		let actual = only(ENROLLED);
+		assert_eq!(
+			actual, expected,
+			"parse(ENROLLED) returned {actual:?}, expected {expected:?}"
+		);
+	}
+
+	#[test]
+	fn a_header_with_no_tokens_is_not_an_error() {
+		// The "never enrolled" case, which section 4.1 treats as distinct from
+		// a drifted one. It must not look like a parse failure.
+		let actual = parse(r#"{"keyslots":{}}"#);
+		assert_eq!(
+			actual,
+			Ok(vec![]),
+			"parse(<header with no tokens>) returned {actual:?}, expected Ok([])"
+		);
+	}
+
+	#[test]
+	fn ignores_tokens_of_other_types() {
+		let json = r#"{"tokens":{"0":{"type":"systemd-fido2","fido2-credential":"x"}}}"#;
+		let actual = parse(json);
+		assert_eq!(
+			actual,
+			Ok(vec![]),
+			"parse(<a fido2 token>) returned {actual:?}, expected Ok([])"
+		);
+	}
+
+	#[test]
+	fn notices_a_pin() {
+		let json = ENROLLED.replace(
+			r#""tpm2-primary-alg": "ecc""#,
+			r#""tpm2-primary-alg": "ecc", "tpm2-pin": true"#,
+		);
+		let actual = only(&json).pin;
+		assert!(
+			actual,
+			"parse(<token with tpm2-pin>) returned pin {actual}, expected true"
+		);
+	}
+
+	#[test]
+	fn notices_a_signed_policy() {
+		// Section 6.2 calls signed policies the right answer for UKI systems.
+		// They are also one we must not silently replace with a literal-PCR
+		// enrollment, so they have to be recognised rather than treated as
+		// ordinary.
+		let json = ENROLLED.replace(
+			r#""tpm2-primary-alg": "ecc""#,
+			r#""tpm2-primary-alg": "ecc", "tpm2_pubkey": "Zm9v", "tpm2_pubkey_pcrs": [11]"#,
+		);
+		let actual = only(&json).advanced;
+		assert_eq!(
+			actual,
+			Some("a signed PCR policy"),
+			"parse(<token with tpm2_pubkey>) returned advanced {actual:?}, expected Some(\"a signed PCR policy\")"
+		);
+	}
+
+	#[test]
+	fn notices_pcrlock() {
+		let json = ENROLLED.replace(
+			r#""tpm2-primary-alg": "ecc""#,
+			r#""tpm2-primary-alg": "ecc", "tpm2_pcrlock": true"#,
+		);
+		let actual = only(&json).advanced;
+		assert_eq!(
+			actual,
+			Some("a pcrlock policy"),
+			"parse(<token with tpm2_pcrlock>) returned advanced {actual:?}, expected Some(\"a pcrlock policy\")"
+		);
+	}
+
+	#[test]
+	fn accepts_a_single_shard_array() {
+		// Newer systemd writes these fields as arrays even when there is only
+		// one shard.
+		let json = ENROLLED.replace(
+			r#""tpm2-policy-hash": "abcdef0123456789""#,
+			r#""tpm2-policy-hash": ["abcdef0123456789"]"#,
+		);
+		let actual = only(&json).policy_hash;
+		let expected = vec![0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89];
+		assert_eq!(
+			actual, expected,
+			"parse(<single-element shard array>) returned policy_hash {actual:?}, expected {expected:?}"
+		);
+	}
+
+	#[test]
+	fn refuses_a_multi_shard_policy() {
+		// Sharding means several policies each protect part of the key.
+		// Rewriting one of them is not something this tool understands, and
+		// taking the first would compare against a digest that only covers part
+		// of the enrollment.
+		let json = ENROLLED.replace(
+			r#""tpm2-policy-hash": "abcdef0123456789""#,
+			r#""tpm2-policy-hash": ["abcdef01", "23456789"]"#,
+		);
+		let actual = parse(&json);
+		assert!(
+			actual.is_err(),
+			"parse(<two-shard policy hash>) returned {actual:?}, expected Err"
+		);
+	}
+
+	#[test]
+	fn rejects_a_token_without_a_policy_hash() {
+		let json = r#"{"tokens":{"0":{"type":"systemd-tpm2","tpm2-pcrs":[7]}}}"#;
+		let actual = parse(json);
+		assert!(
+			actual.is_err(),
+			"parse(<token with no policy hash>) returned {actual:?}, expected Err"
+		);
+	}
+
+	#[test]
+	fn decodes_hex() {
+		let cases = [
+			("00ff", Some(vec![0x00, 0xff])),
+			("AbCd", Some(vec![0xab, 0xcd])),
+			("abc", None),
+			("zz", None),
+		];
+		for (input, expected) in cases {
+			let actual = unhex(input);
+			assert_eq!(
+				actual, expected,
+				"unhex({input:?}) returned {actual:?}, expected {expected:?}"
+			);
+		}
+	}
+}

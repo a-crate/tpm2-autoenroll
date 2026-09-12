@@ -26,11 +26,14 @@ mod askpw;
 mod bindname;
 mod cache;
 mod config;
+mod drift;
 mod listen_fds;
 mod log;
 mod luks;
 mod memfd;
 mod secret;
+mod token;
+mod tpm2;
 mod volume;
 
 use std::io::Write;
@@ -314,11 +317,107 @@ fn serve_passphrase(conn: OwnedFd, volume: &str, config: &config::Volume, cache:
 	notice!("volume {volume:?}: plain phase, so every token type has already failed");
 
 	match acquire(volume, config, cache) {
-		Some(secret) => reply(conn, volume, &secret),
+		Some(secret) => {
+			diagnose(volume, config);
+			reply(conn, volume, &secret)
+		}
 		// Declining hands the prompt back to systemd-cryptsetup, which asks the
 		// user directly on its next iteration. The volume still unlocks; we
 		// have simply used up our turn.
 		None => error!("volume {volume:?}: no passphrase to return; declining"),
+	}
+}
+
+/// Work out *why* the TPM2 unlock failed, and say so.
+///
+/// DESIGN.md section 4.1's preflight, minus the acting on it: this build reports
+/// its verdict and returns the passphrase regardless. Separating the diagnosis
+/// from the repair is deliberate. Every one of these checks is a reason to
+/// refuse to touch the header, so they are worth watching in a real boot before
+/// anything is wired up to rewrite one.
+fn diagnose(volume: &str, config: &config::Volume) {
+	let device = config.device.as_str();
+
+	let tokens = match token::read(device) {
+		Ok(t) => t,
+		Err(e) => {
+			error!("volume {volume:?}: could not read the LUKS2 tokens ({e})");
+			return;
+		}
+	};
+
+	if tokens.is_empty() {
+		// "Never enrolled", which section 4.1 keeps distinct from "drifted":
+		// enrolling here would be creating a binding, not repairing one.
+		notice!(
+			"volume {volume:?}: carries no systemd-tpm2 token, so there is no TPM2 binding to repair"
+		);
+		return;
+	}
+
+	let mut tpm = match tpm2::Tpm::open(&config.tpm2_device) {
+		Ok(t) => t,
+		Err(e) => {
+			// No TPM means a passphrase fallback is the expected state rather
+			// than a fault, and wiping the token would be pure loss.
+			notice!("volume {volume:?}: no usable TPM2 device ({e})");
+			return;
+		}
+	};
+
+	match tpm.lockout() {
+		Ok(l) if l.in_lockout => {
+			// Sealing would succeed and unsealing would keep failing, so we
+			// would rewrite the header every boot and fix nothing. Not a case
+			// to recover from -- a TPM in lockout is a bigger problem than a
+			// stale PCR binding.
+			error!(
+				"volume {volume:?}: the TPM is in dictionary-attack lockout ({} of {} failures); refusing to touch the header",
+				l.counter, l.max_auth_fail
+			);
+			return;
+		}
+		Ok(l) => info!(
+			"volume {volume:?}: TPM responsive, lockout counter {} of {}",
+			l.counter, l.max_auth_fail
+		),
+		Err(e) => {
+			error!("volume {volume:?}: could not read the TPM's lockout state ({e})");
+			return;
+		}
+	}
+
+	for t in &tokens {
+		let verdict = drift::check(&mut tpm, t);
+		notice!(
+			"volume {volume:?}: token {}: {}",
+			t.index,
+			verdict.describe()
+		);
+
+		if let drift::Drift::Drifted { .. } = verdict {
+			log_pcrs(volume, &mut tpm, t);
+		}
+	}
+}
+
+/// The audit line section 6 asks for: what the machine measured at the moment we
+/// were consulted, which is what a re-enrollment would seal against.
+fn log_pcrs(volume: &str, tpm: &mut tpm2::Tpm, t: &token::Tpm2Token) {
+	let bank = t
+		.bank
+		.as_deref()
+		.and_then(tpm2::Bank::from_name)
+		.unwrap_or(tpm2::Bank::SHA256);
+
+	match tpm.read_pcrs(bank, &t.pcrs) {
+		Ok(values) => {
+			for (pcr, digest) in values {
+				let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+				info!("volume {volume:?}: PCR {pcr} is now {hex}");
+			}
+		}
+		Err(e) => warning!("volume {volume:?}: could not read the current PCR values ({e})"),
 	}
 }
 
