@@ -302,14 +302,36 @@ in
       '';
     }) initrdVolumes;
 
-    # 9.1's footgun. PCRs 11 and up keep being extended by userspace after the
-    # point a system-stage volume is unlocked, so such a volume would seal
-    # against a state that has already moved on and fall back on every boot.
-    # That follows from the PCR choice rather than from this tool, but the tool
-    # makes it easy to arrive at by accident, which is what earns a warning.
+    # 9.1's footgun. A system-stage volume bound to a register that userspace
+    # keeps extending would seal against a state that has already moved on by
+    # the next unlock, and fall back on every boot. That follows from the PCR
+    # choice rather than from this tool, but the tool makes it easy to arrive at
+    # by accident, which is what earns a warning.
+    #
+    # 9.1 says "PCR 11 or above", which is too broad to be useful: 14 is the
+    # shim MOK list, extended in the boot loader phase and not after, 16 is the
+    # debug PCR nothing touches unless asked, and 17-22 are D-RTM. Warning on
+    # those would be a false positive on every use of the debug PCR -- including
+    # this tool's own tests -- which is how a warning gets trained away. The
+    # registers systemd's userspace tooling actually extends are:
+    #
+    #   11  systemd-pcrphase, at leave-initrd and again at sysinit and ready
+    #   12  kernel command line and credentials
+    #   13  system extension images
+    #   15  machine ID and file system identity (pcrmachine, pcrfs)
     warnings =
       let
-        volatile = v: lib.filter (p: p >= 11) (pcrsOf v);
+        volatile =
+          v:
+          lib.filter (
+            p:
+            lib.elem p [
+              11
+              12
+              13
+              15
+            ]
+          ) (pcrsOf v);
       in
       lib.mapAttrsToList (
         volume: v:

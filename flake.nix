@@ -73,6 +73,14 @@
           socket-core = pkgs.callPackage ./nix/vmtest.nix {
             tpm2-autoenrolld = self.packages.${system}.tpm2-autoenrolld;
           };
+
+          # Imports ./nix/module.nix rather than nixosModules.default, so the
+          # test machine's package is the one passed in here and the check does
+          # not depend on self.packages resolving inside a nixosSystem.
+          module = pkgs.callPackage ./nix/moduletest.nix {
+            tpm2-autoenroll-module = ./nix/module.nix;
+            tpm2-autoenrolld = self.packages.${system}.tpm2-autoenrolld;
+          };
         });
     };
 }
