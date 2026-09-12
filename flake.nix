@@ -37,6 +37,17 @@
         default = tpm2-autoenrolld;
       });
 
+      # No overlay: setting the option is enough, and nixpkgs.overlays from an
+      # imported module fights the nixpkgs.pkgs that flake-based configurations
+      # commonly set. mkDefault so a user can still substitute their own build.
+      nixosModules.tpm2-autoenroll = { pkgs, lib, ... }: {
+        imports = [ ./nix/module.nix ];
+        services.tpm2-autoenroll.package =
+          lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.tpm2-autoenrolld;
+      };
+
+      nixosModules.default = self.nixosModules.tpm2-autoenroll;
+
       devShells = forAllSystems (system: pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
