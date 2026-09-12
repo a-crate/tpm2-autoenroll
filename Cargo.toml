@@ -1,0 +1,22 @@
+[package]
+name = "tpm2-autoenrolld"
+version = "0.1.0"
+edition = "2021"
+description = "Re-bind TPM2-enrolled LUKS2 volumes to the current PCR state at the point of unlock"
+license = "MIT"
+
+[[bin]]
+name = "tpm2-autoenrolld"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["net", "event", "process", "fs"] }
+zeroize = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
