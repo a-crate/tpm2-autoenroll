@@ -1,6 +1,6 @@
 # tpm2-autoenroll design
 
-Status: sections 2, 3 and 5 implemented and verified; sections 4, 6 and 7 not
+Status: sections 2-6 implemented and verified; section 7 (the NixOS module) not
 yet built
 Target: systemd 260 (verified against 260.2 source, and against a running 260.2)
 
@@ -378,16 +378,55 @@ where re-enrolling is useless or destructive:
 | a TPM2 device is present and responsive | no TPM means fallback is expected, not a drift; wiping the token would be pure loss |
 | the TPM is not in dictionary-attack lockout | sealing would succeed but unsealing keeps failing, so we would churn the header every boot |
 | the volume already carries a systemd-tpm2 token, or `enrollIfAbsent` is set | distinguishes "drifted" from "never enrolled" |
+| exactly one such token | `--wipe-slot=tpm2` removes every one of them, so with two we would destroy a binding that is not ours |
+| it is a plain PCR policy, not a signed or pcrlock one | those are policies we cannot recreate, so replacing one is a downgrade (6.2) |
 | the current PCR values differ from the enrolled policy | if they match, the fallback had some other cause and re-enrolling fixes nothing |
 
 The last check also prevents the pathological loop where enrollment succeeds but
 unlock keeps failing for an unrelated reason.
 
-Lockout detection reads `TPM_PT_LOCKOUT_COUNTER` via `TPM2_GetCapability`. This
-is not a case we aim to handle gracefully -- a TPM in lockout means the machine
-has a bigger problem than a stale PCR binding. The check exists only to stop us
-rewriting the LUKS header on every boot of a machine in that state. Log and
-decline; do not attempt recovery.
+Lockout detection reads `TPM_PT_PERMANENT` via `TPM2_GetCapability` and tests
+`inLockout`, alongside `TPM_PT_LOCKOUT_COUNTER` and `TPM_PT_MAX_AUTH_FAIL` for
+the log line. An earlier draft named only the counter, which is the wrong
+question: a nonzero counter is ordinary, and what matters is whether the TPM is
+presently refusing authorizations. This is not a case we aim to handle
+gracefully -- a TPM in lockout means the machine has a bigger problem than a
+stale PCR binding. The check exists only to stop us rewriting the LUKS header on
+every boot of a machine in that state. Log and decline; do not attempt recovery.
+
+Reading the properties doubles as the "is a TPM present and responsive" check:
+a TPM that answers this answers anything else we need.
+
+#### How the drift check is actually done
+
+The enrolled side is read from the LUKS2 header: the `systemd-tpm2` token
+records the PCR selection, the bank, and `tpm2-policy-hash`, the digest the
+volume was sealed against.
+
+The current side is computed **by the TPM**, in a trial session: `PolicyPCR`
+over the registers as they stand right now, then `PolicyAuthValue` if the token
+carries a PIN, which is the sequence `tpm2_calculate_sealing_policy()` builds.
+A trial session authorizes nothing; computing this digest is what it is for.
+Passing an empty `pcrDigest` to `TPM2_PolicyPCR` is what makes it a question
+about the machine's present state rather than a check against a value we supply.
+
+The alternative was to reimplement systemd's policy construction in software,
+which means owning a copy of its hashing and keeping that correct across systemd
+releases. Asking the hardware that will later be asked to unseal is less code
+and a better authority. The test that matters is in section 8: a volume whose
+PCRs have not moved must come out as *matching*, and it only does if the digest
+computed here equals the one `systemd-cryptenroll` sealed with.
+
+This check is deliberately conservative. A token whose blob has been corrupted,
+or whose SRK no longer exists, would in fact be repaired by re-enrolling -- but
+it presents identically to one where re-sealing would change nothing, so we
+decline both. Declining costs a manual repair; guessing costs a header rewrite
+on every boot, forever.
+
+Talking to `/dev/tpmrm0` directly, rather than through a TSS binding or
+tpm2-tools, keeps the static musl build of section 9 and puts neither in the
+initrd. The price is marshalling four commands by hand, which is affordable
+because none of them takes a session or an authorization.
 
 ### 4.2 Enrollment
 
@@ -411,18 +450,60 @@ enrollment with the newly added slot always excluded. This gives the safety
 property we want: an interrupted run leaves either the old slot, the new slot, or
 both -- never zero. The passphrase slot is untouched in every case.
 
+The `<spec>` keeps the bank the old token named, as `PCR:BANK` pairs -- `16:sha256`
+rather than bare `16`. A repair should reproduce the enrollment it replaces, not
+quietly move it to whichever bank systemd would pick by default today.
+
+The selection likewise comes from the token being repaired rather than from
+`tpm2Pcrs` in the config. The config describes what a *fresh* enrollment would
+bind to; narrowing or widening an existing binding is a policy change, and not
+one to make silently on a fallback path. `tpm2Pcrs` is consulted only when there
+is no token to copy, i.e. under `enrollIfAbsent`.
+
 Open: whether `--unlock-key-file=` strips a trailing newline. We write the exact
 bytes ask-password handed us, which should have none, so this may never bite.
 But the asymmetry between terminal input (newline-stripped) and key-file input
-(verbatim) is a classic source of "correct passphrase rejected" bugs, so it is
-worth a deliberate five-minute experiment early in implementation rather than a
-confusing failure later.
+(verbatim) is a classic source of "correct passphrase rejected" bugs. The tier 1
+test exercises the real path end to end with a passphrase that has no newline,
+so the question is now narrower than it was: what remains untested is a
+passphrase that *does* carry one, which our own prompt should never produce.
 
 ### 4.3 Verification
 
 After enrollment, test-unseal against the new policy before returning. If the
 new slot does not actually unlock, log loudly -- the old slot is already gone at
 that point, but the passphrase still works, so the volume is recoverable.
+
+There are two ways to do this, and which one is available depends on the same
+thing section 2.4 turns on:
+
+- **`cryptsetup open --test-passphrase --token-only --token-id=N`.** With
+  `--token-only` there is no passphrase fallback, so success is a real TPM2
+  unseal and nothing else. This is the strong form, and it needs
+  `libcryptsetup-token-systemd-tpm2.so`.
+- **Comparing the new token's policy against the current PCRs**, using the same
+  trial session as the drift check (4.1). Available always, and it covers the
+  failure this tool can actually cause -- sealing against the wrong state. It
+  would not notice an unusable SRK.
+
+Try the first, fall back to the second, and say in the log which one was used.
+An initrd trimmed of the token plugin gets the weaker check, which is the right
+trade: refusing to verify at all would mean either skipping verification or
+refusing to repair on exactly the systems that need repairing most.
+
+On **nixpkgs the strong form is never available**, established while building
+this: systemd installs the plugin into its own output, and `pkgs.cryptsetup`'s
+plugin directory is empty, so the standalone CLI cannot load it even on a full
+system. Most distributions install both into `${libdir}/cryptsetup/` and do get
+the strong check. A `--external-tokens-path=` pointing at systemd's directory
+would recover it, but that is a path only the NixOS module could know, and the
+policy comparison already covers the failure mode this tool can cause. Noted
+rather than fixed.
+
+Note that `cryptsetup open --token-only` reports "no token could unlock this"
+as exit status 1 with **nothing on stderr**, which reads like an argument error
+and is not what the man page's return-code table would suggest. Verified
+directly against 2.8.6.
 
 ### 4.4 Cost
 
@@ -520,8 +601,18 @@ changed PCR state falls back to a passphrase prompt and stays there until
 someone attends to it -- exactly as it would without this tool installed. Those
 deployments want signed PCR policies or pcrlock instead (6.2).
 
-Every re-enrollment logs the old and new PCR values so the event is auditable
-after the fact.
+Every re-enrollment logs the old and new policy digests and the current PCR
+values, so the event is auditable after the fact.
+
+Two implementation details follow from consent being a prompt rather than a
+setting. It goes out through `systemd-ask-password` like the passphrase does, so
+whichever agent owns the console renders it -- but with `--echo=yes`, since the
+answer is not a secret, and with **no** `--keyname=`, because pushing "y" into
+the `cryptsetup` keyring would leave it sitting there as a candidate passphrase
+for the next volume. And anything that is not an explicit `y`/`yes` is a
+refusal, including a timeout, a closed prompt, or an agent that failed outright:
+refusing costs a manual repair, while assuming consent re-binds the volume to
+whatever boot chain is running.
 
 ### 6.2 Relationship to upstream approaches
 
@@ -696,26 +787,69 @@ Added to tier 1 alongside the canary, since both are cheap once two volumes
 exist:
 
 - two LUKS volumes sharing a passphrase, asserting the second is answered from
-  the daemon's cache with no second prompt (section 5). Re-enrolling them
-  independently is still to come with section 4.
+  the daemon's cache with no second prompt (section 5), and that the refusal
+  given for the first covers the second as well (section 11).
 - a wrong passphrase at the prompt, asserting the daemon asks again rather than
   returning it, that exactly one passphrase reaches systemd-cryptsetup, and that
   the header is untouched. This is the observable form of 2.3's "we get one
   shot": if validation regressed, systemd-cryptsetup would burn an attempt on
   the typo and the assertion on the retry line would fail.
 
+### The preflight cases
+
+Three volumes are enough to reach all of them, and the PCR 16 trick means each
+is a `systemctl start` rather than a reboot:
+
+- **drifted, consent refused** -- the header digest must be byte-identical
+  afterwards. This is the section 6 guarantee, and the cheapest thing to get
+  subtly wrong.
+- **drifted, consent given** -- the header digest must change, the token must
+  move to a different index (`--wipe-slot=tpm2` removes the old, enrollment adds
+  the new), and the daemon must report verifying the result. Then, with the PCRs
+  still where they were, restarting the volume must unlock it with **no prompt
+  at all**. That last step is section 8's "boot 3" without a reboot, and it is
+  what distinguishes a real repair from a plausible-looking header write.
+- **not drifted** -- a volume that reaches the plain phase while its policy still
+  matches the PCRs must be declined, and must never reach the consent prompt.
+  Manufactured by re-sealing against the live PCR value and then mangling the
+  token's blob, which breaks unsealing while leaving `tpm2-policy-hash` alone.
+
+  This case carries more weight than its size suggests: it passes only if the
+  digest the daemon computes in a TPM trial session equals the one
+  `systemd-cryptenroll` sealed with. Two independent computations, from opposite
+  directions, asserted equal. If the trial-session approach of 4.1 is ever wrong,
+  this is the test that says so.
+- **never enrolled** -- a volume with no systemd-tpm2 token and `enrollIfAbsent`
+  unset must be left exactly as it is.
+
 ## 9. Implementation notes
 
 Rust. The daemon needs `getpeername`/`getsockname` on AF_UNIX with abstract
 names, `sd_listen_fds`-style fd pickup, subprocess control for
-`systemd-cryptenroll` and `systemd-ask-password`, a TSS binding for the lockout
-counter, and reliable erasure of key material. Static musl build to keep the
-initrd closure small.
+`systemd-cryptenroll`, `systemd-ask-password` and `cryptsetup`, a way to ask the
+TPM about lockout state and policy digests, and reliable erasure of key
+material. Static musl build to keep the initrd closure small.
+
+An earlier draft said "a TSS binding" for the TPM half. That turned out to be
+unnecessary: the four commands we need (`GetCapability`, `PCR_Read`,
+`StartAuthSession`, `PolicyPCR`/`PolicyAuthValue`/`PolicyGetDigest`,
+`FlushContext`) take no sessions and no authorizations, so marshalling them by
+hand onto `/dev/tpmrm0` is a few hundred lines and keeps both tpm2-tss and
+tpm2-tools out of the initrd -- and keeps the static build possible, which
+linking tpm2-tss would not.
+
+The runtime dependencies are therefore three binaries on `PATH`:
+`systemd-ask-password`, `systemd-cryptenroll` and `cryptsetup`. The first two
+were always expected; `cryptsetup` arrives with passphrase validation (3.3) and
+is reused for the strong form of verification (4.3).
 
 Secret hygiene: `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)` at startup
 (systemd-cryptsetup does exactly this at `cryptsetup.c:2625`, self-deprecatingly
 labelled "a delicious drop of snake oil"), zeroize on drop for every buffer
 holding a passphrase, and never place a passphrase in argv or the environment.
+Passphrases reach child processes through a memfd named by `/proc/self/fd/N`,
+with `FD_CLOEXEC` cleared in the `pre_exec` hook so that exactly one child sees
+it and nothing is left readable in the parent's descriptor table afterwards.
 
 ### 9.1 Stage agnosticism
 
@@ -792,6 +926,8 @@ Mitigations, in order of preference:
   `systemd-ask-password` handles agent dispatch for us, but a yes/no prompt with
   echo has different UX properties than a passphrase prompt, and plymouth's
   handling of it needs checking.
-- Should a declined consent be remembered for the remainder of the boot, so a
-  user with five volumes sharing a passphrase is not asked five times? Leaning
-  yes, scoped to the daemon's lifetime and keyed by PCR state.
+- **Settled: yes.** A declined consent is remembered for the daemon's lifetime,
+  keyed by the policy digest the current PCRs produce. Two volumes reach the
+  same key only when they are bound to the same registers holding the same
+  values, so one refusal answers for all of them and a boot state that differs
+  at all is asked about afresh. Implemented and covered by the tier 1 test.
