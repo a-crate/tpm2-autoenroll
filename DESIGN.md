@@ -1,6 +1,7 @@
 # tpm2-autoenroll design
 
-Status: section 2 implemented and verified; sections 4-7 not yet built
+Status: sections 2, 3 and 5 implemented and verified; sections 4, 6 and 7 not
+yet built
 Target: systemd 260 (verified against 260.2 source, and against a running 260.2)
 
 ## 1. Problem
@@ -288,20 +289,42 @@ on connection(listen_fd, conn_fd):
     peer    = getpeername(conn_fd)           # abstract, leading NUL
     phase   = infix of peer between the random prefix and the volume
 
-    if phase != "/cryptsetup/":
+    if phase != "/cryptsetup/" or volume not in config:
         close(conn_fd)                       # zero bytes: decline, fall through
         return
 
     # plain phase implies TPM2 already failed for this volume
-    pass = cache.get() or ask_passphrase(volume)   # own retry loop on typos
-    if not validate(volume, pass): ...
-    cache.put(pass)
+    device = config[volume].device
+    pass   = None
+
+    for candidate in cache:                  # section 5: ask the user once
+        if validate(device, candidate):
+            pass = candidate
+            break
+
+    for attempt in 0..TRIES:                 # our own retry loop, see 2.3
+        if pass: break
+        for candidate in ask_passphrase(device, accept_cached = attempt == 0):
+            if validate(device, candidate):
+                pass = candidate
+                cache.put(pass)
+                break
+
+    if not pass:
+        close(conn_fd)                       # decline; stock behaviour resumes
+        return
 
     maybe_reenroll(volume, pass)             # synchronous, see 4
 
     write_all(conn_fd, pass)                 # verbatim, no newline
     close(conn_fd)
 ```
+
+`validate()` failing is not an error condition: it is the ordinary outcome of a
+typo, or of a cached passphrase that belongs to a different volume. An error
+condition -- a device that cannot be read at all -- is distinguished from it and
+declines rather than re-asking, since no amount of retyping will conjure the
+device (cryptsetup(8) return code 2 means "bad passphrase" specifically).
 
 Passphrase acquisition delegates to the same primitives systemd-cryptsetup uses
 (`get_password()`, `cryptsetup.c:911`) so the UX and the kernel keyring
@@ -312,6 +335,32 @@ behaviour are identical: `id = "cryptsetup:<cescaped device>"`,
 Accepting the cache means a passphrase already typed for a *non-managed* volume
 is picked up without a second prompt; pushing to the cache means the converse
 also holds.
+
+### 3.3 Validation is what makes the rest of it safe
+
+`validate()` above is not a detail. Three separate things depend on it:
+
+- **Accepting a cached passphrase.** A secret from the kernel keyring was typed
+  for *some* volume, not necessarily this one. Returning it unchecked spends the
+  single attempt of 2.3 on a guess.
+- **Retrying a typo.** Same argument, and it is the more common case.
+- **The consent prompt (6).** Consent is asked only after validation, so a typo
+  never produces one.
+
+It is implemented as `cryptsetup open --test-passphrase` with the candidate in a
+memfd, plus `--disable-external-tokens --disable-keyring` so that the answer is a
+statement about the *passphrase* rather than about some other unlock path. On
+this code path the TPM2 token has just failed, so a token succeeding here would
+be precisely the wrong thing to believe.
+
+`systemd-ask-password` is asked with `--multiple`, because with
+`--accept-cached` and several volumes unlocked earlier in the boot the keyring
+may hold more than one candidate, and taking only the first would let a
+passphrase belonging to another volume mask the one that works. Each candidate
+is validated in turn, capped at four per prompt so a long keyring cannot cost an
+unbounded number of KDF passes. A retry never passes `--accept-cached`: the
+cached entry is what was just rejected, and asking for it again would spin the
+loop without the user being given a chance to type.
 
 ## 4. Re-enrollment
 
@@ -377,12 +426,21 @@ that point, but the passphrase still works, so the volume is recoverable.
 
 ### 4.4 Cost
 
-The passphrase is run through the LUKS2 KDF twice: once by systemd-cryptenroll
-to unlock for enrollment, once by systemd-cryptsetup to activate. With argon2id
-at typical settings that is a few seconds and up to a gigabyte of memory *twice*
-inside the initrd. Acceptable for an interactive fallback path, but worth
-measuring, and worth documenting for anyone running an initrd with a tight memory
-budget.
+The passphrase is run through the LUKS2 KDF three times on the re-enrollment
+path: once by us to validate it (3.3), once by systemd-cryptenroll to unlock for
+enrollment, once by systemd-cryptsetup to activate. With argon2id at typical
+settings that is a few seconds and up to a gigabyte of memory *each time* inside
+the initrd. Acceptable for an interactive fallback path, but worth measuring, and
+worth documenting for anyone running an initrd with a tight memory budget.
+
+Every rejected candidate adds a further pass: a typo costs one, and so does each
+cached passphrase that turns out to belong to a different volume. That is the
+price of never spending our single attempt on an unchecked secret, and it is
+bounded -- three prompts, four candidates each.
+
+The validation pass is paid on every fallback unlock, including the ones that do
+not re-enroll (consent declined, preflight refused). The other two are paid only
+when enrollment actually happens.
 
 ## 5. Multiple volumes and shared passphrases
 
@@ -540,6 +598,47 @@ Assertions:
   the discovery path this design relies on (2.2). This assertion is the one most
   likely to save a user from a silently non-functional setup.
 
+### 7.1 Config file schema
+
+The contract between the module and the daemon. Default path
+`/etc/tpm2-autoenroll/config.json`, overridable with `--config=`.
+
+```json
+{
+  "volumes": {
+    "root": {
+      "device": "/dev/disk/by-uuid/....",
+      "tpm2Device": "auto",
+      "tpm2Pcrs": [7, 11],
+      "enrollIfAbsent": false
+    }
+  }
+}
+```
+
+The key is the volume (mapper) name, matching both the socket path and the
+bindname. `device` is the backing device -- what holds the LUKS2 header -- and is
+the one field with no default: without it the daemon cannot validate a
+passphrase, so a volume that lacks it is not managed.
+
+Values arrive **already resolved**. The module merges its global defaults before
+writing the file, so exactly one component knows what a default is, and the
+daemon's copy of the schema stays a flat read.
+
+Three rules about failure, all chosen so a bad config degrades rather than
+breaks a boot:
+
+- A **missing or unparseable file** is logged and treated as "manage nothing".
+  The daemon still serves its sockets and declines every connection, which is
+  the same outcome as not being installed. Exiting instead would leave
+  systemd-cryptsetup waiting on a connection sitting in a backlog nobody
+  accepts from.
+- A **malformed volume entry** is dropped with a warning; its neighbours are
+  unaffected, the same way one malformed `ListenStream=` does not cost the other
+  volumes their sockets.
+- An **unrecognised key** is warned about, not rejected, so a config written by a
+  newer module still configures the fields an older daemon understands.
+
 ## 8. Test harness
 
 NixOS VM tests with `virtualisation.tpm.enable = true` (swtpm). Two tiers.
@@ -591,13 +690,19 @@ disk is a finicky combination in the NixOS test framework, and failures there
 tend to be infrastructure failures rather than product failures. Tier 1 is what
 should gate CI; tier 2 is what proves the premise.
 
-### Out of selected scope
+### Multi-volume and retry cases
 
-A multi-volume test -- two LUKS volumes sharing a passphrase, asserting the
-second is answered from cache without a second prompt and re-enrolled
-independently -- is not in the chosen test scope, but the behaviour is in scope
-for the implementation (section 5) and the test is cheap to add on top of tier 1.
-Recommended.
+Added to tier 1 alongside the canary, since both are cheap once two volumes
+exist:
+
+- two LUKS volumes sharing a passphrase, asserting the second is answered from
+  the daemon's cache with no second prompt (section 5). Re-enrolling them
+  independently is still to come with section 4.
+- a wrong passphrase at the prompt, asserting the daemon asks again rather than
+  returning it, that exactly one passphrase reaches systemd-cryptsetup, and that
+  the header is untouched. This is the observable form of 2.3's "we get one
+  shot": if validation regressed, systemd-cryptsetup would burn an attempt on
+  the typo and the assertion on the retry line would fail.
 
 ## 9. Implementation notes
 
@@ -677,8 +782,12 @@ Mitigations, in order of preference:
 
 ## 11. Open questions
 
-- Does `systemd-cryptenroll --unlock-key-file=` strip a trailing newline? To be
-  settled empirically during implementation (4.2).
+- Does `systemd-cryptenroll --unlock-key-file=` strip a trailing newline? Still
+  to be settled empirically (4.2), though systemd-cryptenroll(1) leans towards
+  "no": it says the file "has to only contain the full key". The validation step
+  (3.3) narrows the blast radius -- we now know the passphrase is right before
+  cryptenroll sees it, so a failure there is unambiguously cryptenroll's
+  handling of the bytes rather than a wrong secret.
 - Where exactly should the consent prompt render when plymouth owns the console?
   `systemd-ask-password` handles agent dispatch for us, but a yes/no prompt with
   echo has different UX properties than a passphrase prompt, and plymouth's
