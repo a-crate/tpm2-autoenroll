@@ -225,7 +225,7 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 	let mut cache = Cache::new();
 	// Both of these live for the daemon's lifetime, which in the initrd is the
 	// initrd: one passphrase typed once, and one refusal honoured once.
-	let mut declined = consent::Declined::new();
+	let mut decided = consent::Decisions::new();
 
 	loop {
 		let mut polls: Vec<PollFd> = listeners
@@ -252,7 +252,7 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 		for i in ready {
 			let l = &listeners[i];
 			match rustix::net::accept(&l.fd) {
-				Ok(conn) => handle(conn, l, &mut cache, &mut declined),
+				Ok(conn) => handle(conn, l, &mut cache, &mut decided),
 				Err(rustix::io::Errno::INTR) | Err(rustix::io::Errno::AGAIN) => {}
 				Err(e) => error!("volume {:?}: accept failed: {e}", l.volume),
 			}
@@ -272,7 +272,7 @@ fn handle(
 	conn: OwnedFd,
 	listener: &Listener,
 	cache: &mut Cache,
-	declined: &mut consent::Declined,
+	decided: &mut consent::Decisions,
 ) {
 	let volume = listener.volume.as_str();
 
@@ -320,7 +320,7 @@ fn handle(
 
 	match peer_name.phase {
 		Phase::Plain => match &listener.config {
-			Some(config) => serve_passphrase(conn, volume, config, cache, declined),
+			Some(config) => serve_passphrase(conn, volume, config, cache, decided),
 			None => error!("volume {volume:?}: plain phase, but it is not configured; declining"),
 		},
 		phase => {
@@ -338,13 +338,13 @@ fn serve_passphrase(
 	volume: &str,
 	config: &config::Volume,
 	cache: &mut Cache,
-	declined: &mut consent::Declined,
+	decided: &mut consent::Decisions,
 ) {
 	notice!("volume {volume:?}: plain phase, so every token type has already failed");
 
 	match acquire(volume, config, cache) {
 		Some(secret) => {
-			maybe_reenroll(volume, config, &secret, declined);
+			maybe_reenroll(volume, config, &secret, decided);
 			reply(conn, volume, &secret)
 		}
 		// Declining hands the prompt back to systemd-cryptsetup, which asks the
@@ -368,7 +368,7 @@ fn maybe_reenroll(
 	volume: &str,
 	config: &config::Volume,
 	secret: &Secret,
-	declined: &mut consent::Declined,
+	decided: &mut consent::Decisions,
 ) {
 	let mut tpm = match tpm2::Tpm::open(&config.tpm2_device) {
 		Ok(t) => t,
@@ -406,19 +406,28 @@ fn maybe_reenroll(
 	// Section 6: consent is mandatory and has no opt-out. Section 11 asked
 	// whether a refusal should carry across volumes sharing a boot state; it
 	// does, so five volumes bound to the same drifted PCRs ask once.
-	if !plan.state.is_empty() && declined.contains(&plan.state) {
+	if !plan.state.is_empty() && decided.declined(&plan.state) {
 		notice!(
 			"volume {volume:?}: leaving the header alone: re-enrollment was already declined for this boot state"
 		);
 		return;
 	}
 
-	if !consent::ask(volume, &config.device) {
-		notice!("volume {volume:?}: leaving the header alone: re-enrollment was declined");
-		if !plan.state.is_empty() {
-			declined.remember(&plan.state);
-		}
-		return;
+	if !decided.accepted(&plan.state) {
+	    match consent::ask(volume, &config.device) {
+	        consent::Answer::No => {
+			    notice!("volume {volume:?}: leaving the header alone: re-enrollment was declined");
+			    if !plan.state.is_empty() {
+			        decided.decline(&plan.state);
+			    }
+			    return;
+		    }
+		    consent::Answer::Always => {
+		        notice!("volume {volume:?}: automatically re-enrolling this PCR set for future volumes");
+			    decided.accept(&plan.state);
+		    }
+		    _ => {}
+	    }
 	}
 
 	if let Err(e) = enroll::run(
