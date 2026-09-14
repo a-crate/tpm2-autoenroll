@@ -34,17 +34,6 @@ let
     autotest3 = "/dev/vdd";
   };
 
-  daemonConfig = {
-    volumes = builtins.mapAttrs
-      (_: device: {
-        inherit device;
-        tpm2Device = "auto";
-        tpm2Pcrs = [ 16 ];
-        enrollIfAbsent = false;
-      })
-      volumes;
-  };
-
   answerPassphrase = import ./answer-passphrase.nix { inherit pkgs; };
 in
 pkgs.testers.runNixOSTest {
@@ -75,32 +64,19 @@ pkgs.testers.runNixOSTest {
           (volume: device: "${volume} ${device} - noauto,tpm2-device=auto")
           volumes);
 
-    # The daemon's own configuration: which volumes it may act on, and the
-    # backing device behind each (DESIGN.md section 7.1). Without an entry a
-    # volume's connections are declined, so this file is what turns the socket
-    # from inert into useful.
-    environment.etc."tpm2-autoenroll/config.json".text = builtins.toJSON daemonConfig;
-
-    systemd.tmpfiles.rules = [
-      "d /run/cryptsetup-keys.d 0700 root root -"
-    ];
-
-    systemd.sockets.tpm2-autoenrolld = {
-      description = "TPM2 auto-enrollment key socket";
-      wantedBy = [ "sockets.target" ];
-      before = [ "cryptsetup-pre.target" ];
-      unitConfig.DefaultDependencies = "no";
-      socketConfig = {
-        ListenStream = lib.mapAttrsToList
-          (volume: _: "/run/cryptsetup-keys.d/${volume}.key")
-          volumes;
-        Accept = "no";
-        SocketMode = "0600";
-      };
-    };
-
+    # No configuration file and no .socket unit: the daemon takes its volumes
+    # from the crypttab above and binds one socket per TPM2-bound entry itself,
+    # including creating /run/cryptsetup-keys.d. Nothing here tells it that
+    # there are three volumes.
+    #
+    # wantedBy multi-user.target rather than the module's drop-in on
+    # systemd-cryptsetup@.service: this test drives the cryptsetup units by
+    # hand, and what is under test is the daemon rather than the wiring.
+    # moduletest.nix covers the wiring.
     systemd.services.tpm2-autoenrolld = {
-      description = "TPM2 auto-enrollment daemon";
+      description = "TPM2 auto-enrollment key agent";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "cryptsetup-pre.target" ];
       unitConfig.DefaultDependencies = "no";
       # The package carries no PATH of its own, so the caller names the three
       # binaries the daemon shells out to -- systemd-ask-password,
@@ -110,7 +86,10 @@ pkgs.testers.runNixOSTest {
       # from the outside like a wrong passphrase.
       path = [ pkgs.systemd pkgs.cryptsetup ];
       serviceConfig = {
-        Type = "exec";
+        # Type=notify: the daemon says so once every socket is listening, which
+        # is what makes "before cryptsetup" mean anything.
+        Type = "notify";
+        NotifyAccess = "main";
         ExecStart = lib.getExe tpm2-autoenrolld;
       };
     };
@@ -260,9 +239,25 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_file("/dev/tpmrm0")
-    machine.wait_for_unit("tpm2-autoenrolld.socket")
-    machine.succeed(f"test -S /run/cryptsetup-keys.d/{VOLUME}.key")
-    machine.succeed(f"test -S /run/cryptsetup-keys.d/{VOLUME2}.key")
+    machine.wait_for_unit("tpm2-autoenrolld.service")
+
+    with subtest("the daemon found its volumes in the crypttab and bound their sockets"):
+        # Nothing configured the daemon: every socket here exists because the
+        # crypttab entry it is named after carries tpm2-device=.
+        mode = machine.succeed("stat -c %a /run/cryptsetup-keys.d").strip()
+        assert mode == "700", (
+            f"stat -c %a /run/cryptsetup-keys.d returned {mode!r}, expected "
+            "'700': the daemon creates the directory it listens in"
+        )
+        for volume in (VOLUME, VOLUME2, VOLUME3):
+            machine.succeed(f"test -S /run/cryptsetup-keys.d/{volume}.key")
+        mode = machine.succeed(
+            f"stat -c %a /run/cryptsetup-keys.d/{VOLUME}.key"
+        ).strip()
+        assert mode == "600", (
+            f"stat -c %a /run/cryptsetup-keys.d/{VOLUME}.key returned {mode!r}, "
+            "expected '600': the socket hands out passphrases"
+        )
 
     with subtest("three LUKS2 volumes bound to PCR 16, sharing a passphrase"):
         # All enrolled before PCR 16 is touched, so they seal against the same
@@ -583,8 +578,9 @@ pkgs.testers.runNixOSTest {
         )
 
     with subtest("a volume with no TPM2 token is left alone"):
-        # "Never enrolled" rather than "drifted", and enrollIfAbsent is off.
-        # Creating a binding the user never asked for is not a repair.
+        # "Never enrolled" rather than "drifted": there is no token to read a
+        # PCR selection out of, so creating a binding the user never asked for
+        # is not a repair.
         machine.succeed(f"systemctl stop {UNIT3}")
         machine.succeed(f"{CRYPTENROLL} --wipe-slot=tpm2 {DEVICE3}")
         before = header_digest(DEVICE3)
@@ -603,17 +599,17 @@ pkgs.testers.runNixOSTest {
         after = header_digest(DEVICE3)
         assert before == after, (
             f"cryptsetup luksDump {DEVICE3} digest was {before} before and "
-            f"{after} after, expected them to be equal: without enrollIfAbsent "
-            "an unenrolled volume must be left exactly as it is"
+            f"{after} after, expected them to be equal: a volume that was never "
+            "TPM2-bound has no binding to repair and must be left exactly as it is"
         )
 
-    with subtest("both sockets were matched to their configuration at startup"):
-        # A socket with no config entry has no backing device to validate
-        # against, so it declines everything. That the daemon paired each
-        # listener with the right device is what the rest of this test has been
-        # relying on.
+    with subtest("every volume was paired with the device the crypttab names"):
+        # The socket the connection arrived on is what identifies the volume,
+        # and the crypttab is what says which device that volume is backed by.
+        # That the daemon put those two together correctly is what the rest of
+        # this test has been relying on.
         log = "\n".join(daemon_log_lines())
-        for volume, device in ((VOLUME, DEVICE), (VOLUME2, DEVICE2)):
+        for volume, device in ((VOLUME, DEVICE), (VOLUME2, DEVICE2), (VOLUME3, DEVICE3)):
             expected = f'serving volume "{volume}" on {device}'
             assert expected in log, (
                 f"the daemon output was:\n{log}\n"
@@ -625,5 +621,13 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"mkfs.ext4 /dev/mapper/{VOLUME2}")
         machine.succeed(f"mkfs.ext4 /dev/mapper/{VOLUME3}")
         machine.succeed(f"systemctl stop {UNIT} {UNIT2} {UNIT3}")
+
+    with subtest("stopping the daemon takes its sockets out of the way"):
+        # /run survives switch-root, so a socket left behind here is one stage
+        # 2's systemd-cryptsetup would find and connect to with nobody on the
+        # other end. The daemon unlinks them when it is asked to stop.
+        machine.succeed("systemctl stop tpm2-autoenrolld.service")
+        for volume in (VOLUME, VOLUME2, VOLUME3):
+            machine.fail(f"test -e /run/cryptsetup-keys.d/{volume}.key")
   '';
 }

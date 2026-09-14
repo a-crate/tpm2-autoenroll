@@ -14,12 +14,12 @@
 //! | it is not in dictionary-attack lockout | sealing succeeds, unsealing keeps failing, and we rewrite the header every boot |
 //! | exactly one systemd-tpm2 token | `--wipe-slot=tpm2` removes all of them; with two, one of them is someone else's working binding |
 //! | the enrollment is a plain PCR policy | a signed or pcrlock policy is one we cannot recreate, so replacing it is a downgrade |
-//! | the volume has a token at all, or `enrollIfAbsent` | distinguishes "drifted" from "never enrolled" |
+//! | the volume has a token at all | a volume that was never TPM2-bound has no binding to repair, and no PCR selection to infer one from |
 //! | the PCRs actually drifted | if they match, re-sealing the same policy changes nothing and the next boot fails identically |
 
-use crate::config;
+use crate::crypttab::Volume;
 use crate::drift::{self, Drift};
-use crate::log::{error, info, notice};
+use crate::log::{error, info};
 use crate::token::{self, Tpm2Token};
 use crate::tpm2::Tpm;
 
@@ -50,7 +50,7 @@ pub struct Plan {
 	pub state: Vec<u8>,
 }
 
-pub fn check(volume: &str, config: &config::Volume, tpm: &mut Tpm) -> Decision {
+pub fn check(volume: &str, config: &Volume, tpm: &mut Tpm) -> Decision {
 	let device = config.device.as_str();
 
 	let tokens = match token::read(device) {
@@ -80,7 +80,7 @@ pub fn check(volume: &str, config: &config::Volume, tpm: &mut Tpm) -> Decision {
 	}
 
 	match tokens.len() {
-		0 => absent(volume, config),
+		0 => absent(),
 		1 => drifted(&tokens[0], tpm),
 		n => Decision::Leave(format!(
 			"the header carries {n} systemd-tpm2 tokens, and --wipe-slot=tpm2 would remove all of them"
@@ -89,36 +89,16 @@ pub fn check(volume: &str, config: &config::Volume, tpm: &mut Tpm) -> Decision {
 }
 
 /// The "never enrolled" case, which is not a repair.
-fn absent(volume: &str, config: &config::Volume) -> Decision {
-	if !config.enroll_if_absent {
-		return Decision::Leave(
-			"it carries no systemd-tpm2 token, so there is no TPM2 binding to repair \
-			 (set enrollIfAbsent to create one)"
-				.to_string(),
-		);
-	}
-
-	if config.tpm2_pcrs.is_empty() {
-		// With no token to copy a selection from and none configured, there is
-		// nothing to bind to. Enrolling against an empty selection would
-		// produce a token that unseals unconditionally, which is worse than
-		// doing nothing.
-		return Decision::Leave(
-			"enrollIfAbsent is set but no tpm2Pcrs are configured, so there is nothing to bind to"
-				.to_string(),
-		);
-	}
-
-	notice!("volume {volume:?}: no TPM2 binding yet, and enrollIfAbsent is set");
-	Decision::Reenroll(Plan {
-		old_token: None,
-		pcrs: config.tpm2_pcrs.clone(),
-		enrolled: Vec::new(),
-		bank: None,
-		// No enrolled policy to compare against, so the consent question is
-		// about this volume alone rather than about a shared boot state.
-		state: Vec::new(),
-	})
+///
+/// There is deliberately no way to turn this into one. The PCR selection a
+/// volume should be bound to is read out of the token being replaced, so a
+/// volume with no token supplies nothing to bind against, and guessing a
+/// selection on a fallback path would be inventing a policy the user never
+/// chose. `systemd-cryptenroll` is the tool for a first enrollment.
+fn absent() -> Decision {
+	Decision::Leave(
+		"it carries no systemd-tpm2 token, so there is no TPM2 binding to repair".to_string(),
+	)
 }
 
 /// The ordinary case: one token, and the question is whether it has gone stale.
@@ -167,59 +147,22 @@ pub fn log_state(volume: &str, tpm: &mut Tpm, plan: &Plan) {
 mod tests {
 	use super::*;
 
-	fn config(enroll_if_absent: bool, pcrs: Vec<u8>) -> config::Volume {
-		config::Volume {
-			device: "/dev/vdb".to_string(),
-			tpm2_device: "auto".to_string(),
-			tpm2_pcrs: pcrs,
-			enroll_if_absent,
-		}
-	}
-
 	#[test]
-	fn an_unenrolled_volume_is_left_alone_by_default() {
+	fn an_unenrolled_volume_is_left_alone() {
 		// Section 4.1's "distinguishes drifted from never enrolled". Creating a
 		// binding the user never asked for is not a repair.
-		let actual = absent("data", &config(false, vec![7]));
+		let actual = absent();
 		assert!(
 			matches!(actual, Decision::Leave(_)),
-			"absent(<enrollIfAbsent = false>) returned {actual:?}, expected Decision::Leave(_)"
-		);
-	}
-
-	#[test]
-	fn enroll_if_absent_creates_one() {
-		let expected = Plan {
-			old_token: None,
-			pcrs: vec![7, 11],
-			bank: None,
-			enrolled: vec![],
-			state: vec![],
-		};
-		let actual = absent("data", &config(true, vec![7, 11]));
-		assert_eq!(
-			actual,
-			Decision::Reenroll(expected.clone()),
-			"absent(<enrollIfAbsent = true, pcrs [7, 11]>) returned {actual:?}, expected Reenroll({expected:?})"
-		);
-	}
-
-	#[test]
-	fn enroll_if_absent_still_needs_something_to_bind_to() {
-		// An empty selection enrolls a token that unseals whatever the boot
-		// state, which is a worse outcome than leaving the volume alone.
-		let actual = absent("data", &config(true, vec![]));
-		assert!(
-			matches!(actual, Decision::Leave(_)),
-			"absent(<enrollIfAbsent = true, no pcrs>) returned {actual:?}, expected Decision::Leave(_)"
+			"absent() returned {actual:?}, expected Decision::Leave(_)"
 		);
 	}
 
 	#[test]
 	fn a_repair_keeps_the_selection_it_repairs() {
-		// The config's tpm2Pcrs describe what a fresh enrollment would use.
-		// Repairing an existing binding must not quietly move it to a different
-		// set of registers.
+		// The PCR selection a volume is bound to lives in its token, and nowhere
+		// else. Repairing an existing binding must not quietly move it to a
+		// different set of registers.
 		let token = Tpm2Token {
 			index: 2,
 			pcrs: vec![7, 11],

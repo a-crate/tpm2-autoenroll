@@ -1,32 +1,29 @@
 # What the NixOS module adds, as opposed to what the daemon does.
 #
-# vmtest.nix hand-writes the units and the config file and then exercises the
-# daemon's state machine through them. This test writes neither: everything the
-# machine runs comes from `services.tpm2-autoenroll`, so what is under test is
-# the module's half of the contract -- that the units it generates are wired
-# into systemd correctly, and that the config file it writes is the one the
-# daemon reads.
+# vmtest.nix hand-writes the unit and then exercises the daemon's state machine
+# through it. This test writes no units at all: everything the machine runs
+# comes from `services.tpm2-autoenroll`, so what is under test is the module's
+# half of the contract.
 #
 # Assertions, in order of importance:
 #
-#   1. The socket is listening before the volume it serves is unlocked, without
-#      the test arranging that. This is the module's central job and the one
-#      DESIGN.md section 3.1 had wrong: ordering against cryptsetup-pre.target
-#      alone is inert, because that target carries RefuseManualStart and is only
-#      pulled in by the cryptsetup generator.
-#   2. /run/cryptsetup-keys.d exists with the right mode, created by
-#      DirectoryMode= rather than by a tmpfiles.d entry.
-#   3. The config file's contents are the module's globals merged with each
-#      volume's overrides, which is what lets the daemon treat its schema as a
-#      flat read (7.1).
-#   4. Nothing runs until something needs it: on a healthy boot the token plugin
-#      unlocks the volume and the daemon is never started at all (2.4).
-#   5. The generated wiring actually carries a repair end to end, so a passing
+#   1. The daemon is running, with its sockets bound, before the volume it
+#      serves is unlocked -- without the test arranging either. That is the
+#      module's central job, and it rests on two things: the drop-in that puts
+#      Wants=/After= on every systemd-cryptsetup@ instance, and Type=notify,
+#      which is what makes "after" mean "after the sockets exist" rather than
+#      "after the binary was exec'd".
+#   2. The daemon manages exactly the TPM2-bound volumes of the crypttab it
+#      finds, less anything in services.tpm2-autoenroll.ignore. Nothing in this
+#      configuration lists a volume.
+#   3. A healthy boot is undisturbed: the token plugin unlocks the volume and
+#      the daemon never says a word.
+#   4. The generated wiring actually carries a repair end to end, so a passing
 #      module test is not merely a passing unit-file diff.
 #
-# The volumes are at stage = "system", so the units land in stage 2 where the
-# test can drive them; the initrd path differs only in where the same two units
-# are written.
+# stages = [ "systemd" ] puts the units in stage 2 where the test can drive
+# them; the initrd path differs only in where the same unit and drop-in are
+# written.
 {
   pkgs,
   tpm2-autoenroll-module,
@@ -50,6 +47,7 @@ pkgs.testers.runNixOSTest {
       virtualisation.emptyDiskImages = [
         512
         512
+        512
       ];
       virtualisation.memorySize = 2048;
 
@@ -59,52 +57,32 @@ pkgs.testers.runNixOSTest {
         answerPassphrase
       ];
 
+      # The whole of the machine's volume configuration, and the module never
+      # reads it: the daemon does, at startup, in the stage it is running in.
+      #
       # Field 3 is "-": no key file, which is what makes systemd-cryptsetup set
-      # try_discover_key and consult the module's socket (2.2). noauto keeps the
+      # try_discover_key and consult the daemon's socket. noauto keeps the
       # unlock under the test's control rather than under boot ordering.
       #
-      # NixOS has no first-class option for stage-2 crypttab the way it has
-      # boot.initrd.luks.devices for stage 1, so this is written by hand. It is
-      # the only part of the machine's configuration that is.
+      # modtest2 names its TPM by path rather than "auto", so the daemon is
+      # shown taking that from the crypttab as well.
       environment.etc.crypttab.text = ''
         modtest /dev/vdb - noauto,tpm2-device=auto
-        modtest2 /dev/vdc - noauto,tpm2-device=auto
+        modtest2 /dev/vdc - noauto,tpm2-device=/dev/tpmrm0
+        modtest3 /dev/vdd - noauto,tpm2-device=auto
       '';
 
       services.tpm2-autoenroll = {
         enable = true;
         package = tpm2-autoenrolld;
-
-        # PCR 16 is the debug PCR, resettable from userspace, which is how the
-        # policy mismatch is manufactured without a reboot.
-        tpm2Pcrs = [ 16 ];
-
-        volumes.modtest = {
-          device = "/dev/vdb";
-          stage = "system";
-        };
-
-        # Overrides on every field that has one, so the merge in 7.1 is visible
-        # in the file rather than merely asserted to happen.
-        volumes.modtest2 = {
-          device = "/dev/vdc";
-          stage = "system";
-          tpm2Device = "/dev/tpmrm0";
-          tpm2Pcrs = [
-            16
-            7
-          ];
-          enrollIfAbsent = true;
-        };
+        stages = [ "systemd" ];
+        ignore = [ "modtest3" ];
       };
     };
 
   testScript = ''
-    import json
-
     PASSPHRASE = ${builtins.toJSON passphrase}
     CRYPTENROLL = "${pkgs.systemd}/bin/systemd-cryptenroll"
-    SOCKET = "tpm2-autoenrolld.socket"
     SERVICE = "tpm2-autoenrolld.service"
     UNIT = "systemd-cryptsetup@modtest.service"
 
@@ -152,91 +130,91 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_file("/dev/tpmrm0")
 
-    with subtest("the module writes the config file the daemon expects"):
-        # Both halves of 7.1's contract in one assertion: the path the daemon
-        # defaults to, and per-volume values already merged with the globals so
-        # that config.rs never has to know what a default is.
-        actual = json.loads(machine.succeed("cat /etc/tpm2-autoenroll/config.json"))
-        expected = {
-            "volumes": {
-                "modtest": {
-                    "device": "/dev/vdb",
-                    "tpm2Device": "auto",
-                    "tpm2Pcrs": [16],
-                    "enrollIfAbsent": False,
-                },
-                "modtest2": {
-                    "device": "/dev/vdc",
-                    "tpm2Device": "/dev/tpmrm0",
-                    "tpm2Pcrs": [16, 7],
-                    "enrollIfAbsent": True,
-                },
-            }
-        }
-        assert actual == expected, (
-            f"/etc/tpm2-autoenroll/config.json contained {actual}, expected "
-            f"{expected}: modtest takes every global, modtest2 overrides each "
-            "one, and both must arrive at the daemon already resolved"
+    with subtest("the module writes the ignore list the daemon reads"):
+        actual = machine.succeed("cat /etc/tpm2-autoenroll/ignore")
+        assert actual == "modtest3\n", (
+            f"/etc/tpm2-autoenroll/ignore contained {actual!r}, expected "
+            "'modtest3\\n': one entry per line at the path the daemon defaults to"
         )
 
     with subtest("nothing is running before a volume needs it"):
-        # The socket is wanted by the systemd-cryptsetup@ units rather than by
-        # sockets.target, so on a machine where nothing has been unlocked yet
-        # neither unit has any reason to exist.
-        state = machine.succeed(f"systemctl is-active {SOCKET} || true").strip()
+        # The daemon is pulled in by the systemd-cryptsetup@ instances rather
+        # than by a target, so on a machine where nothing has been unlocked yet
+        # it has no reason to exist.
+        state = machine.succeed(f"systemctl is-active {SERVICE} || true").strip()
         assert state == "inactive", (
-            f"systemctl is-active {SOCKET} returned {state!r}, expected "
-            "'inactive': the socket is pulled in by the volumes it serves, not "
-            "by sockets.target"
+            f"systemctl is-active {SERVICE} returned {state!r}, expected "
+            "'inactive': the daemon is pulled in by the volumes it serves"
         )
         machine.fail("test -e /run/cryptsetup-keys.d")
+
+    with subtest("the drop-in orders every cryptsetup instance after the daemon"):
+        # The module never names a volume, so this has to hold for instances it
+        # has never heard of. Checking the property on the unit is what says the
+        # drop-in landed on the template rather than on one instance.
+        after = machine.succeed(f"systemctl show -p After --value {UNIT}").split()
+        assert SERVICE in after, (
+            f"systemctl show -p After --value {UNIT} returned {after}, expected "
+            f"it to contain {SERVICE!r}: the drop-in is what makes the daemon "
+            "start first"
+        )
 
     with subtest("two LUKS2 volumes bound to PCR 16"):
         format_and_enroll("/dev/vdb")
         format_and_enroll("/dev/vdc")
 
-    with subtest("starting a volume pulls the socket up first"):
-        # The module's central claim. Nothing here starts the socket: the
-        # [Install] WantedBy on systemd-cryptsetup@modtest.service does, and the
-        # Before= on the same unit is what makes "first" true. If either were
-        # missing, discover_key() would find no socket and the volume would
-        # still unlock -- silently losing the feature -- so the assertions below
-        # are on the socket, not on the volume.
+    with subtest("starting a volume pulls the daemon up first"):
+        # Nothing here starts the daemon: the Wants= in the drop-in does, and
+        # the After= is what makes "first" true. If either were missing,
+        # discover_key() would find no socket and the volume would still unlock
+        # -- silently losing the feature -- so the assertions below are on the
+        # daemon, not on the volume.
         watch = LogWatch()
         machine.succeed(f"systemctl start {UNIT}")
         machine.succeed("test -b /dev/mapper/modtest")
 
-        state = machine.succeed(f"systemctl is-active {SOCKET}").strip()
+        state = machine.succeed(f"systemctl is-active {SERVICE}").strip()
         assert state == "active", (
-            f"systemctl is-active {SOCKET} returned {state!r} after starting "
-            f"{UNIT}, expected 'active': the socket must be pulled in by the "
+            f"systemctl is-active {SERVICE} returned {state!r} after starting "
+            f"{UNIT}, expected 'active': the daemon must be pulled in by the "
             "volume it serves"
         )
 
-        # DirectoryMode= in place of the tmpfiles.d entry DESIGN.md 3.1 called
-        # for. systemd.socket(5) creates a ListenStream= path's parent
-        # directories, and this is the setting that decides their mode.
+        # The daemon creates its own directory; there is no tmpfiles.d entry
+        # whose ordering in the initrd we would otherwise have to prove.
         mode = machine.succeed("stat -c %a /run/cryptsetup-keys.d").strip()
         assert mode == "700", (
-            f"stat -c %a /run/cryptsetup-keys.d returned {mode!r}, expected "
-            "'700' from DirectoryMode="
+            f"stat -c %a /run/cryptsetup-keys.d returned {mode!r}, expected '700'"
         )
         for volume in ("modtest", "modtest2"):
             machine.succeed(f"test -S /run/cryptsetup-keys.d/{volume}.key")
         mode = machine.succeed("stat -c %a /run/cryptsetup-keys.d/modtest.key").strip()
         assert mode == "600", (
             f"stat -c %a /run/cryptsetup-keys.d/modtest.key returned {mode!r}, "
-            "expected '600' from SocketMode="
+            "expected '600'"
         )
 
+        # services.tpm2-autoenroll.ignore, end to end: modtest3 is TPM2-bound in
+        # the same crypttab as the other two and still gets no socket, so it can
+        # never be prompted for or re-enrolled.
+        machine.fail("test -e /run/cryptsetup-keys.d/modtest3.key")
+
+        log = "\n".join(daemon_log_lines())
+        for volume, device in (("modtest", "/dev/vdb"), ("modtest2", "/dev/vdc")):
+            expected = f'serving volume "{volume}" on {device}'
+            assert expected in log, (
+                f"the daemon output was:\n{log}\n"
+                f"expected a {expected!r} line: the daemon's whole view of the "
+                "machine comes from the crypttab"
+            )
+
         # 2.4: with the token plugin present the volume unseals from its header
-        # before the retry loop runs, so the daemon is not merely silent here --
-        # it was never started. That is the cheapest possible cost on the happy
-        # path, and it is a property of the socket being activation-triggered.
-        state = machine.succeed(f"systemctl is-active {SERVICE} || true").strip()
-        assert state == "inactive", (
-            f"systemctl is-active {SERVICE} returned {state!r} after a healthy "
-            "TPM2 unlock, expected 'inactive': the token plugin returns before "
+        # before the retry loop runs, so the daemon is started but never
+        # consulted. That is the cheapest the happy path can be while still
+        # guaranteeing the socket is in place before the unlock.
+        assert "plain phase" not in watch.new(), (
+            f"a healthy TPM2 unlock produced:\n{watch.new()}\n"
+            "expected no 'plain phase' line: the token plugin returns before "
             "discover_key() runs, so nothing should have connected to us"
         )
         pending = pending_password_requests()
@@ -244,13 +222,10 @@ pkgs.testers.runNixOSTest {
             f"pending_password_requests() returned {pending!r}, expected an "
             "empty string: a healthy TPM2 volume must unlock without prompting"
         )
-        assert watch.new() == "", (
-            "the daemon logged output during a healthy unlock, expected none"
-        )
         machine.succeed(f"systemctl stop {UNIT}")
 
-    with subtest("a drifted volume is repaired through the generated units"):
-        # End to end over the module's wiring: nothing in this subtest knows
+    with subtest("a drifted volume is repaired through the generated wiring"):
+        # End to end over the module's units: nothing in this subtest knows
         # where the socket is or how the daemon was configured.
         machine.succeed(
             "tpm2_pcrextend 16:sha256=$(head -c32 /dev/urandom | sha256sum | cut -d' ' -f1)"
@@ -266,12 +241,6 @@ pkgs.testers.runNixOSTest {
         machine.succeed("test -b /dev/mapper/modtest")
 
         log = watch.new()
-        assert 'serving volume "modtest" on /dev/vdb' in log, (
-            f"the daemon output was:\n{log}\n"
-            "expected a 'serving volume \"modtest\" on /dev/vdb' line: the "
-            "listening socket's path and the module's config file have to name "
-            "the same volume for either to be useful"
-        )
         assert "the TPM2 binding has gone stale and can be repaired" in log, (
             f"the daemon output was:\n{log}\n"
             "expected the preflight to find a repairable binding after PCR 16 "

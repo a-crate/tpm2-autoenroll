@@ -109,13 +109,14 @@ fn classify_response(answer: &[u8]) -> Answer {
 	// `--multiple` is not passed, but an agent may still terminate its reply
 	// with a newline, and a user may well hit space before return.
 	let first = text.lines().next().unwrap_or("").trim();
-	if matches!(first.to_ascii_lowercase().as_str(), "y") {
-	    return Answer::Yes
+	// The prompt spells the options out as "y(es)/n(o)/a(lways)", so both
+	// spellings of each have to work. Nothing else does: an answer we do not
+	// recognise is a refusal.
+	match first.to_ascii_lowercase().as_str() {
+		"y" | "yes" => Answer::Yes,
+		"a" | "always" => Answer::Always,
+		_ => Answer::No,
 	}
-	if matches!(first.to_ascii_lowercase().as_str(), "a") {
-	    return Answer::Always
-	}
-	Answer::No
 }
 
 #[cfg(test)]
@@ -124,11 +125,14 @@ mod tests {
 
 	#[test]
 	fn classify_answers_correctly() {
-	    let cases: [(&[u8], Answer); 13] = [
+	    let cases: [(&[u8], Answer); 17] = [
 					(b"y".as_slice(), Answer::Yes),
 					(b"Y".as_slice(), Answer::Yes),
+					(b"yes".as_slice(), Answer::Yes),
+					(b"YES".as_slice(), Answer::Yes),
 					(b"a".as_slice(), Answer::Always),
 					(b"A".as_slice(), Answer::Always),
+					(b"always".as_slice(), Answer::Always),
 					(b"y\n".as_slice(), Answer::Yes),
 					(b"  y  ".as_slice(), Answer::Yes),
 					(b"", Answer::No),
@@ -138,12 +142,13 @@ mod tests {
 					(b"yeah", Answer::No),
 					(b"ye s", Answer::No),
 					(b"1", Answer::No),
+					(b"all", Answer::No),
 					];
 		for (input, expect) in cases {
 			let actual = classify_response(input);
 			assert_eq!(
 				actual, expect,
-				"is_yes({input:?}) returned {actual:?}, expected {expect:?}"
+				"classify_response({input:?}) returned {actual:?}, expected {expect:?}"
 			);
 		}
 	}

@@ -33,22 +33,24 @@
 mod askpw;
 mod bindname;
 mod cache;
-mod config;
 mod consent;
+mod crypttab;
 mod drift;
 mod enroll;
-mod listen_fds;
+mod ignore;
 mod log;
 mod luks;
 mod memfd;
+mod notify;
 mod preflight;
 mod secret;
+mod sockets;
 mod token;
 mod tpm2;
-mod volume;
 
 use std::io::Write;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustix::event::{PollFd, PollFlags};
 use rustix::net::{SocketAddrAny, SocketAddrUnix};
@@ -56,6 +58,7 @@ use rustix::net::{SocketAddrAny, SocketAddrUnix};
 use crate::askpw::Attempt;
 use crate::bindname::Phase;
 use crate::cache::Cache;
+use crate::crypttab::Volume;
 use crate::drift::Drift;
 use crate::log::{error, info, notice, warning};
 use crate::luks::Verdict;
@@ -70,18 +73,29 @@ const TRIES: usize = 3;
 /// A listening socket together with the volume it serves.
 struct Listener {
 	fd: OwnedFd,
-	volume: String,
-	/// `None` for a volume the config file does not mention. Such a volume
-	/// keeps its listener and declines every connection: not accepting at all
-	/// would leave systemd-cryptsetup waiting on a connection sitting in the
-	/// backlog, which is worse for the boot than falling back to stock
-	/// behaviour.
-	config: Option<config::Volume>,
+	path: String,
+	volume: Volume,
+}
+
+/// Set from the SIGTERM handler; read by the accept loop.
+///
+/// The daemon is asked to stop at switch-root, and the sockets it leaves behind
+/// in /run are still there when stage 2 looks for a discovered key. Unlinking
+/// them is the whole reason we bother to notice the signal.
+static TERMINATE: AtomicBool = AtomicBool::new(false);
+
+/// The paths a run is configured with. Every one of them has a default that is
+/// right on a NixOS system; the overrides exist so the daemon can be driven by
+/// hand without a machine's real crypttab being involved.
+struct Args {
+	crypttab: String,
+	ignore: String,
+	socket_dir: String,
 }
 
 fn main() -> std::process::ExitCode {
-	let config_path = match parse_args() {
-		Ok(Some(p)) => p,
+	let args = match parse_args() {
+		Ok(Some(a)) => a,
 		Ok(None) => return std::process::ExitCode::SUCCESS,
 		Err(e) => {
 			error!("{e}");
@@ -90,23 +104,25 @@ fn main() -> std::process::ExitCode {
 	};
 
 	lock_memory();
+	catch_sigterm();
 
-	// A config we cannot read is not a reason to exit. Every volume then
-	// declines, which is the same outcome as not being installed.
-	let config = match config::load(&config_path) {
-		Ok(c) => {
-			if c.is_empty() {
-				warning!("{config_path} configures no volumes; every connection will be declined");
-			}
-			c
-		}
+	let volumes = match discover(&args) {
+		Ok(v) => v,
 		Err(e) => {
-			error!("{e}; every connection will be declined");
-			config::Config::default()
+			error!("{e}");
+			return std::process::ExitCode::FAILURE;
 		}
 	};
 
-	let listeners = match setup(&config) {
+	if volumes.is_empty() {
+		// Not a failure: a machine with no TPM2-bound volume in this stage has
+		// nothing for us to do, and saying so beats sitting on an empty poll.
+		notice!("{}: no TPM2-bound volumes to serve", args.crypttab);
+		notify::ready();
+		return std::process::ExitCode::SUCCESS;
+	}
+
+	let listeners = match listen(&args.socket_dir, volumes) {
 		Ok(l) => l,
 		Err(e) => {
 			error!("{e}");
@@ -115,39 +131,146 @@ fn main() -> std::process::ExitCode {
 	};
 
 	for l in &listeners {
-		match &l.config {
-			Some(c) => info!("serving volume {:?} on {}", l.volume, c.device),
-			None => error!(
-				"volume {:?} has a socket but no configuration; declining its connections",
-				l.volume
-			),
-		}
+		info!(
+			"serving volume {:?} on {} via {}",
+			l.volume.name, l.volume.device, l.path
+		);
 	}
 
-	serve(&listeners)
+	// Only now: the unit is ordered before the systemd-cryptsetup instances, and
+	// with Type=notify this is the point at which that ordering starts to mean
+	// "the socket is already there".
+	notify::ready();
+
+	let code = serve(&listeners);
+	shutdown(&listeners);
+	code
 }
 
-/// Returns the config path to use, or `None` when the invocation was one that
-/// only prints something.
-fn parse_args() -> Result<Option<String>, String> {
-	let mut path = config::DEFAULT_PATH.to_string();
+/// Returns the paths to use, or `None` when the invocation was one that only
+/// prints something.
+fn parse_args() -> Result<Option<Args>, String> {
+	let mut args = Args {
+		crypttab: crypttab::DEFAULT_PATH.to_string(),
+		ignore: ignore::DEFAULT_PATH.to_string(),
+		socket_dir: sockets::DEFAULT_DIR.to_string(),
+	};
 
 	for arg in std::env::args().skip(1) {
 		if arg == "--version" {
 			let mut out = std::io::stdout();
 			let _ = writeln!(out, "{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 			return Ok(None);
-		} else if let Some(p) = arg.strip_prefix("--config=") {
-			if p.is_empty() {
-				return Err("--config= needs a path".to_string());
-			}
-			path = p.to_string();
-		} else {
+		}
+
+		let Some((name, value)) = arg.split_once('=') else {
 			return Err(format!("unrecognised argument {arg:?}"));
+		};
+		if value.is_empty() {
+			return Err(format!("{name}= needs a path"));
+		}
+		match name {
+			"--crypttab" => args.crypttab = value.to_string(),
+			"--ignore" => args.ignore = value.to_string(),
+			"--socket-dir" => args.socket_dir = value.to_string(),
+			_ => return Err(format!("unrecognised argument {arg:?}")),
 		}
 	}
 
-	Ok(Some(path))
+	Ok(Some(args))
+}
+
+/// Which volumes this run will manage: the TPM2-bound entries of the crypttab,
+/// less the ones the user has opted out.
+fn discover(args: &Args) -> Result<Vec<Volume>, String> {
+	let volumes = match crypttab::load(&args.crypttab) {
+		Ok(v) => v,
+		// Nothing to serve rather than a fault: a stage with no crypttab has no
+		// encrypted volumes in it.
+		Err(e) if missing(&args.crypttab) => {
+			notice!("{e}; nothing to serve");
+			return Ok(Vec::new());
+		}
+		Err(e) => return Err(e),
+	};
+
+	let ignored = ignore::load(&args.ignore)?;
+	if ignored.is_empty() {
+		return Ok(volumes);
+	}
+
+	Ok(volumes
+		.into_iter()
+		.filter(|v| {
+			let keep = !ignored.covers(v);
+			if !keep {
+				notice!(
+					"volume {:?} is listed in {}; it will never be re-enrolled",
+					v.name,
+					args.ignore
+				);
+			}
+			keep
+		})
+		.collect())
+}
+
+fn missing(path: &str) -> bool {
+	!std::path::Path::new(path).exists()
+}
+
+/// Bind one socket per volume.
+///
+/// A volume whose socket cannot be created is dropped rather than fatal: it
+/// falls back to stock systemd-cryptsetup behaviour, and the volumes that did
+/// bind are still served.
+fn listen(dir: &str, volumes: Vec<Volume>) -> Result<Vec<Listener>, String> {
+	sockets::ensure_dir(dir)?;
+
+	let mut listeners = Vec::with_capacity(volumes.len());
+	for volume in volumes {
+		let path = sockets::path(dir, &volume.name);
+		match sockets::bind(&path) {
+			Ok(fd) => listeners.push(Listener { fd, path, volume }),
+			Err(e) => error!(
+				"volume {:?}: could not listen on {path} ({e}); it will unlock as if we were not installed",
+				volume.name
+			),
+		}
+	}
+
+	if listeners.is_empty() {
+		return Err("no usable listening sockets".to_string());
+	}
+	Ok(listeners)
+}
+
+/// Take the sockets back out of the filesystem.
+///
+/// /run survives switch-root, so a socket left here is one stage 2's
+/// systemd-cryptsetup will find, connect to, and get nothing from.
+fn shutdown(listeners: &[Listener]) {
+	for l in listeners {
+		if let Err(e) = sockets::clear(&l.path) {
+			warning!("could not remove {} ({e})", l.path);
+		}
+	}
+}
+
+/// Notice SIGTERM rather than dying on it, so `shutdown` gets to run.
+///
+/// poll(2) is never restarted after a handler runs, regardless of SA_RESTART
+/// (signal(7)), so the accept loop finds out on its next trip round.
+fn catch_sigterm() {
+	extern "C" fn handler(_signal: libc::c_int) {
+		TERMINATE.store(true, Ordering::Relaxed);
+	}
+
+	// SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+	unsafe {
+		libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+		libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+	}
 }
 
 /// Pin our pages so key material cannot reach swap.
@@ -165,49 +288,6 @@ fn lock_memory() {
 			std::io::Error::last_os_error()
 		);
 	}
-}
-
-/// Take the listening fds and work out which volume each one serves.
-fn setup(config: &config::Config) -> Result<Vec<Listener>, String> {
-	let fds = listen_fds::take()?;
-
-	let mut listeners = Vec::with_capacity(fds.len());
-	for fd in fds {
-		let path = match socket_path(fd.as_fd()) {
-			Ok(p) => p,
-			Err(e) => {
-				error!("could not read a listening socket's path ({e}); ignoring it");
-				continue;
-			}
-		};
-
-		match volume::from_socket_path(&path) {
-			Some(v) => {
-				let volume = String::from_utf8_lossy(v).into_owned();
-				let config = config.get(&volume).cloned();
-				listeners.push(Listener { fd, volume, config });
-			}
-			None => error!(
-				"listening socket {:?} is not named <volume>.key; ignoring it",
-				String::from_utf8_lossy(&path)
-			),
-		}
-	}
-
-	if listeners.is_empty() {
-		return Err("no usable listening sockets".to_string());
-	}
-	Ok(listeners)
-}
-
-/// The filesystem path a listening socket is bound to.
-fn socket_path(fd: BorrowedFd<'_>) -> Result<Vec<u8>, String> {
-	let addr = rustix::net::getsockname(fd).map_err(|e| format!("getsockname: {e}"))?;
-	let unix = unix_addr(&addr).ok_or_else(|| "not an AF_UNIX address".to_string())?;
-	let path = unix.path().ok_or_else(|| {
-		"socket has no filesystem path; ListenStream= must name a path".to_string()
-	})?;
-	Ok(path.to_bytes().to_vec())
 }
 
 fn unix_addr(addr: &SocketAddrAny) -> Option<SocketAddrUnix> {
@@ -233,7 +313,14 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 			.map(|l| PollFd::new(&l.fd, PollFlags::IN))
 			.collect();
 
-		match rustix::event::poll(&mut polls, None) {
+		let woken = rustix::event::poll(&mut polls, None);
+
+		if TERMINATE.load(Ordering::Relaxed) {
+			notice!("asked to stop; removing the key sockets");
+			return std::process::ExitCode::SUCCESS;
+		}
+
+		match woken {
 			Ok(_) => {}
 			Err(rustix::io::Errno::INTR) => continue,
 			Err(e) => {
@@ -252,9 +339,9 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 		for i in ready {
 			let l = &listeners[i];
 			match rustix::net::accept(&l.fd) {
-				Ok(conn) => handle(conn, l, &mut cache, &mut decided),
+				Ok(conn) => handle(conn, &l.volume, &mut cache, &mut decided),
 				Err(rustix::io::Errno::INTR) | Err(rustix::io::Errno::AGAIN) => {}
-				Err(e) => error!("volume {:?}: accept failed: {e}", l.volume),
+				Err(e) => error!("volume {:?}: accept failed: {e}", l.volume.name),
 			}
 		}
 	}
@@ -264,17 +351,11 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 ///
 /// Every path out of here that is not a deliberate reply drops `conn`, which
 /// closes it having written nothing -- the zero-byte decline. That is the
-/// fail-closed default: an unparseable peer name, an unrecognised phase, a
-/// volume that disagrees with the socket it arrived on, or a volume we have no
-/// configuration for all degrade to stock systemd-cryptsetup behaviour rather
-/// than guessing.
-fn handle(
-	conn: OwnedFd,
-	listener: &Listener,
-	cache: &mut Cache,
-	decided: &mut consent::Decisions,
-) {
-	let volume = listener.volume.as_str();
+/// fail-closed default: an unparseable peer name, an unrecognised phase, or a
+/// volume that disagrees with the socket it arrived on all degrade to stock
+/// systemd-cryptsetup behaviour rather than guessing.
+fn handle(conn: OwnedFd, managed: &Volume, cache: &mut Cache, decided: &mut consent::Decisions) {
+	let volume = managed.name.as_str();
 
 	// `None` means the peer never bound a name of its own. systemd-cryptsetup
 	// always does, so this is not one of its connections.
@@ -319,10 +400,7 @@ fn handle(
 	}
 
 	match peer_name.phase {
-		Phase::Plain => match &listener.config {
-			Some(config) => serve_passphrase(conn, volume, config, cache, decided),
-			None => error!("volume {volume:?}: plain phase, but it is not configured; declining"),
-		},
+		Phase::Plain => serve_passphrase(conn, managed, cache, decided),
 		phase => {
 			info!(
 				"volume {volume:?}: {} phase, declining with zero bytes",
@@ -335,11 +413,11 @@ fn handle(
 /// The plain phase: TPM2 has already failed for this volume.
 fn serve_passphrase(
 	conn: OwnedFd,
-	volume: &str,
-	config: &config::Volume,
+	config: &Volume,
 	cache: &mut Cache,
 	decided: &mut consent::Decisions,
 ) {
+	let volume = config.name.as_str();
 	notice!("volume {volume:?}: plain phase, so every token type has already failed");
 
 	match acquire(volume, config, cache) {
@@ -366,7 +444,7 @@ fn serve_passphrase(
 /// still needs its passphrase next time -- exactly where it was before we ran.
 fn maybe_reenroll(
 	volume: &str,
-	config: &config::Volume,
+	config: &Volume,
 	secret: &Secret,
 	decided: &mut consent::Decisions,
 ) {
@@ -451,7 +529,7 @@ fn maybe_reenroll(
 ///
 /// The old slot is gone by now, so a failure here is worth saying loudly -- but
 /// it is not a disaster, because the passphrase slot was never involved.
-fn verify(volume: &str, config: &config::Volume, plan: &preflight::Plan, tpm: &mut tpm2::Tpm) {
+fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2::Tpm) {
 	let tokens = match token::read(&config.device) {
 		Ok(t) => t,
 		Err(e) => {
@@ -506,7 +584,7 @@ fn verify(volume: &str, config: &config::Volume, plan: &preflight::Plan, tpm: &m
 /// cached or freshly typed, is validated before it is returned -- which is
 /// precisely what makes it safe to accept a secret we did not watch the user
 /// type.
-fn acquire(volume: &str, config: &config::Volume, cache: &mut Cache) -> Option<Secret> {
+fn acquire(volume: &str, config: &Volume, cache: &mut Cache) -> Option<Secret> {
 	let device = config.device.as_str();
 
 	if !cache.is_empty() {
