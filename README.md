@@ -81,6 +81,11 @@ Usage of this module increases your susceptibility to evil maid attacks.
 Accepting re-enrollment when you were not expecting a change in PCRs could leak your disk encryption keys to an attacker.
 However, typing in your password at all when you were not expecting a change in PCRs could leak your keys to an attacker.
 
-## Notes
+## AI Policy
 
-Don't trust any documentation outside of README.md, it's all LLM generated and therefore mostly terrible.
+The use of AI or LLMs to wholly or partially write the following things is forbidden:
+* Direct communication with humans.
+  This includes pull request titles, description, and comments.
+* Documentation files in this repository. This includes markdown documentation, but does _not_ include code comments.
+
+All other usage of AI is welcome and permitted.
