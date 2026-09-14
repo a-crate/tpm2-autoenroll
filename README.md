@@ -21,12 +21,12 @@ Boot continues as normal.
 Build the binary, and run it as a systemd unit.
 The unit should:
 
-1. Set `DefaultDependencies=no`
+1. Set `DefaultDependencies=no` and `Type=notify`
 2. Run before and conflict with `initrd-switch-root` and `shutdown` targets.
 3. Run before `cryptsetup-pre.target` 
 4. Run before and be wanted by `systemd-cryptsetup@$VOLUME.service` for each volume.
 
-`systemd-cryptenroll` and `systemd-ask-password` must be in `$PATH`.
+`cryptsetup`, `systemd-cryptenroll`, and `systemd-ask-password` must be in `$PATH`.
 
 TODO: write a dracut module, maybe.
 
@@ -37,7 +37,7 @@ On start, tpm2-autoenroll will find disks configured to unlock with tpm in `/etc
 The TPM device will be detected from `/etc/crypttab`.
 The PCRs will be detected from the `systemd-tpm2` token data.
 
-If you want to ignore a device and never be prompted for re-enrollment, put the device name (matching crypttab) in `/etc/tmp2-autoenroll/ignore`, one per line.
+If you want to ignore a device and never be prompted for re-enrollment, put the device name (matching crypttab) in `/etc/tpm2-autoenroll/ignore`, one per line.
 
 ### NixOS
 
@@ -61,7 +61,7 @@ A nixos module and flake is present. Configuration example is present below.
       ];
     };
   };
-  services.tpm2-autoenroll {
+  services.tpm2-autoenroll = {
     enable = true;
     stages = [ "systemd" "initrd" ];
     ignore = [ "/dev/disk/by-uuid/abc" ];
