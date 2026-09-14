@@ -41,7 +41,33 @@ If you want to ignore a device and never be prompted for re-enrollment, put the 
 
 ### NixOS
 
-A nixos module and flake is present. Configuration example is present below.
+A nixos module and flake is present. 
+Flake configuration looks something like this:
+
+```nix
+{
+  description = "NixOS configuration";
+
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    tpm2-autoenroll.url = "github:a-crate/tpm2-autoenroll";
+  };
+
+  outputs = inputs@{ nixpkgs, tpm2-autoenroll, ... }: {
+    nixosConfigurations = {
+      hostname = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          ./configuration.nix
+          tpm2-autoenroll.nixosModules.default
+        ];
+      };
+    };
+  };
+}
+```
+
+And actual usage looks something like this:
 
 ```nix
 {
@@ -63,7 +89,7 @@ A nixos module and flake is present. Configuration example is present below.
   };
   services.tpm2-autoenroll = {
     enable = true;
-    stages = [ "systemd" "initrd" ];
+    stages = [ "systemd" "initrd" ]; # Default is initrd only.
     ignore = [ "/dev/disk/by-uuid/abc" ];
   };
 }
