@@ -5,30 +5,18 @@
 //! systemd-cryptsetup consults on every iteration of its unlock loop, and
 //! answers according to which phase of that loop it is being asked in.
 //!
-//! What this build does:
-//!
 //!   * TPM2 / FIDO2 / PKCS#11 phase -- reply with zero bytes and close. The
 //!     empty reply leaves `iovec_is_set(key_data)` false, so the dispatch at
 //!     cryptsetup.c:2044 falls through to the LUKS2 header token and ordinary
 //!     TPM2 unlocking is untouched.
-//!   * plain phase -- being asked here at all means every token type has already
-//!     failed for this volume. Answer from the passphrase cache if one of its
-//!     entries opens the volume, otherwise prompt, and in either case return a
-//!     passphrase only once it has been checked against the volume's header.
-//!     We get one attempt before systemd-cryptsetup reverts to prompting the
-//!     user itself (DESIGN.md section 2.3), so a typo is retried here rather
-//!     than spent there.
+//!   * plain phase -- every token type has already failed for this volume, so
+//!     this is the fallback. Produce a passphrase known to open the volume,
+//!     then preflight, ask a human, re-enroll and verify, all before replying,
+//!     so nothing is half-done if the initrd goes away.
 //!
-//! Having established that the volume really has fallen back and that we hold a
-//! passphrase that really works, the plain phase then does what the tool exists
-//! for: check that re-binding would actually help (`preflight`), ask a human
-//! (`consent`), run `systemd-cryptenroll`, and verify the result -- all before
-//! the passphrase is returned, so nothing is half-done if the initrd goes away.
-//!
-//! The invariant underneath all of it is **enroll at the point of unlock**. The
-//! PCR values read when we are consulted are, by construction, the values that
-//! will be present the next time this volume is unlocked at this same point in
-//! boot. Nothing here knows or cares whether that point is in the initrd.
+//! The invariant underneath it is enroll at the point of unlock: the PCR values
+//! read when we are consulted are, by construction, the values present the next
+//! time this volume is unlocked at this same point in boot.
 
 mod askpw;
 mod bindname;
@@ -65,12 +53,9 @@ use crate::luks::Verdict;
 use crate::secret::Secret;
 
 /// How many times we ask before handing the prompt back to systemd-cryptsetup.
-///
-/// Matches `arg_tries` (cryptsetup.c:87), which is the number of tries a user
-/// gets with us not installed.
+/// Matches `arg_tries` (cryptsetup.c:87).
 const TRIES: usize = 3;
 
-/// A listening socket together with the volume it serves.
 struct Listener {
 	fd: OwnedFd,
 	path: String,
@@ -78,15 +63,10 @@ struct Listener {
 }
 
 /// Set from the SIGTERM handler; read by the accept loop.
-///
-/// The daemon is asked to stop at switch-root, and the sockets it leaves behind
-/// in /run are still there when stage 2 looks for a discovered key. Unlinking
-/// them is the whole reason we bother to notice the signal.
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
-/// The paths a run is configured with. Every one of them has a default that is
-/// right on a NixOS system; the overrides exist so the daemon can be driven by
-/// hand without a machine's real crypttab being involved.
+/// Every path defaults to what a NixOS system uses; the overrides exist so the
+/// daemon can be driven by hand without a machine's real crypttab involved.
 struct Args {
 	crypttab: String,
 	ignore: String,
@@ -116,7 +96,7 @@ fn main() -> std::process::ExitCode {
 
 	if volumes.is_empty() {
 		// Not a failure: a machine with no TPM2-bound volume in this stage has
-		// nothing for us to do, and saying so beats sitting on an empty poll.
+		// nothing for us to do.
 		notice!("{}: no TPM2-bound volumes to serve", args.crypttab);
 		notify::ready();
 		return std::process::ExitCode::SUCCESS;
@@ -137,7 +117,7 @@ fn main() -> std::process::ExitCode {
 		);
 	}
 
-	// Only now: the unit is ordered before the systemd-cryptsetup instances, and
+	// Only now. The unit is ordered before the systemd-cryptsetup instances, and
 	// with Type=notify this is the point at which that ordering starts to mean
 	// "the socket is already there".
 	notify::ready();
@@ -147,8 +127,7 @@ fn main() -> std::process::ExitCode {
 	code
 }
 
-/// Returns the paths to use, or `None` when the invocation was one that only
-/// prints something.
+/// `None` when the invocation only printed something and should exit.
 fn parse_args() -> Result<Option<Args>, String> {
 	let mut args = Args {
 		crypttab: crypttab::DEFAULT_PATH.to_string(),
@@ -185,8 +164,7 @@ fn parse_args() -> Result<Option<Args>, String> {
 fn discover(args: &Args) -> Result<Vec<Volume>, String> {
 	let volumes = match crypttab::load(&args.crypttab) {
 		Ok(v) => v,
-		// Nothing to serve rather than a fault: a stage with no crypttab has no
-		// encrypted volumes in it.
+		// A stage with no crypttab has no encrypted volumes in it.
 		Err(e) if missing(&args.crypttab) => {
 			notice!("{e}; nothing to serve");
 			return Ok(Vec::new());
@@ -222,8 +200,8 @@ fn missing(path: &str) -> bool {
 /// Bind one socket per volume.
 ///
 /// A volume whose socket cannot be created is dropped rather than fatal: it
-/// falls back to stock systemd-cryptsetup behaviour, and the volumes that did
-/// bind are still served.
+/// falls back to stock systemd-cryptsetup behaviour, and the rest are still
+/// served.
 fn listen(dir: &str, volumes: Vec<Volume>) -> Result<Vec<Listener>, String> {
 	sockets::ensure_dir(dir)?;
 
@@ -275,9 +253,8 @@ fn catch_sigterm() {
 
 /// Pin our pages so key material cannot reach swap.
 ///
-/// systemd-cryptsetup does exactly this (cryptsetup.c:2625) and calls it "a
-/// delicious drop of snake oil", which is about right: it is worth doing and
-/// not worth failing over, so a refusal is logged and the daemon continues.
+/// systemd-cryptsetup does the same (cryptsetup.c:2625) and calls it "a
+/// delicious drop of snake oil": worth doing, not worth failing over.
 fn lock_memory() {
 	// SAFETY: mlockall has no memory-safety preconditions; it either pins the
 	// address space or returns an error.
@@ -297,14 +274,12 @@ fn unix_addr(addr: &SocketAddrAny) -> Option<SocketAddrUnix> {
 /// Accept and answer connections, one at a time, forever.
 ///
 /// Serial handling is a requirement rather than a simplification: several
-/// `systemd-cryptsetup@.service` instances can be unlocking in parallel, and
-/// two console passphrase prompts interleaving would be unusable. It is also
-/// what makes the cache worth having -- the second volume's connection is
-/// handled after the first has produced a passphrase, not alongside it.
+/// `systemd-cryptsetup@.service` instances can be unlocking in parallel, and two
+/// console prompts interleaving would be unusable. It is also what makes the
+/// cache worth having -- the second volume's connection is handled after the
+/// first has produced a passphrase, not alongside it.
 fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 	let mut cache = Cache::new();
-	// Both of these live for the daemon's lifetime, which in the initrd is the
-	// initrd: one passphrase typed once, and one refusal honoured once.
 	let mut decided = consent::Decisions::new();
 
 	loop {
@@ -349,16 +324,15 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 
 /// Answer one connection.
 ///
-/// Every path out of here that is not a deliberate reply drops `conn`, which
-/// closes it having written nothing -- the zero-byte decline. That is the
-/// fail-closed default: an unparseable peer name, an unrecognised phase, or a
-/// volume that disagrees with the socket it arrived on all degrade to stock
-/// systemd-cryptsetup behaviour rather than guessing.
+/// Every path out of here that is not a deliberate reply drops `conn`, closing
+/// it having written nothing -- the zero-byte decline. That is the fail-closed
+/// default: anything we cannot make sense of degrades to stock
+/// systemd-cryptsetup behaviour rather than being guessed at.
 fn handle(conn: OwnedFd, managed: &Volume, cache: &mut Cache, decided: &mut consent::Decisions) {
 	let volume = managed.name.as_str();
 
-	// `None` means the peer never bound a name of its own. systemd-cryptsetup
-	// always does, so this is not one of its connections.
+	// systemd-cryptsetup always binds a name of its own, so an unnamed peer is
+	// not one of its connections.
 	let peer = match rustix::net::getpeername(&conn) {
 		Ok(Some(p)) => p,
 		Ok(None) => {
@@ -376,8 +350,8 @@ fn handle(conn: OwnedFd, managed: &Volume, cache: &mut Cache, decided: &mut cons
 		return;
 	};
 
-	// systemd-cryptsetup binds its end to an abstract name. The bytes are not
-	// NUL-terminated; rustix hands us the slice with its real length.
+	// The abstract name's bytes are not NUL-terminated; rustix hands us the
+	// slice with its real length.
 	let Some(name) = unix.abstract_name() else {
 		warning!("volume {volume:?}: peer is not in the abstract namespace; declining");
 		return;
@@ -426,22 +400,18 @@ fn serve_passphrase(
 			reply(conn, volume, &secret)
 		}
 		// Declining hands the prompt back to systemd-cryptsetup, which asks the
-		// user directly on its next iteration. The volume still unlocks; we
-		// have simply used up our turn.
+		// user directly. The volume still unlocks; we have used up our turn.
 		None => error!("volume {volume:?}: no passphrase to return; declining"),
 	}
 }
 
 /// Repair the TPM2 binding, if that is the right thing to do and a human agrees.
 ///
-/// Synchronous and before the passphrase is returned (DESIGN.md section 4): the
-/// user is already stopped at a console prompt, so the latency is not on an
-/// otherwise-unattended path, and finishing before we reply removes any chance
-/// of the initrd tearing down mid-enrollment.
-///
-/// Every failure here is survivable, which is why none of them stops the boot.
-/// The passphrase slot is never touched, so the worst outcome is a volume that
-/// still needs its passphrase next time -- exactly where it was before we ran.
+/// Synchronous and before the passphrase is returned: the user is already
+/// stopped at a console prompt, so the latency is not on an unattended path,
+/// and finishing before we reply removes any chance of the initrd tearing down
+/// mid-enrollment. Every failure here is survivable and none stops the boot,
+/// because the passphrase slot is never touched.
 fn maybe_reenroll(
 	volume: &str,
 	config: &Volume,
@@ -451,8 +421,8 @@ fn maybe_reenroll(
 	let mut tpm = match tpm2::Tpm::open(&config.tpm2_device) {
 		Ok(t) => t,
 		Err(e) => {
-			// No TPM means falling back to a passphrase is the expected state
-			// rather than a fault, and wiping the token would be pure loss.
+			// With no TPM the passphrase fallback is the expected state rather
+			// than a fault, and wiping the token would be pure loss.
 			notice!("volume {volume:?}: leaving the header alone: no usable TPM2 device ({e})");
 			return;
 		}
@@ -466,9 +436,8 @@ fn maybe_reenroll(
 		}
 	};
 
-	// Section 6 wants every re-enrollment auditable after the fact, which means
-	// saying what the policy was as well as what it is about to become. The PCR
-	// values behind the new digest follow on the next lines.
+	// An auditable re-enrollment means saying what the policy was as well as
+	// what it is about to become; log_state adds the PCR values behind it.
 	if plan.enrolled.is_empty() {
 		notice!("volume {volume:?}: no TPM2 binding yet, and one can be created");
 	} else {
@@ -481,9 +450,8 @@ fn maybe_reenroll(
 	}
 	preflight::log_state(volume, &mut tpm, &plan);
 
-	// Section 6: consent is mandatory and has no opt-out. Section 11 asked
-	// whether a refusal should carry across volumes sharing a boot state; it
-	// does, so five volumes bound to the same drifted PCRs ask once.
+	// A decision carries across volumes sharing a boot state, so five volumes
+	// bound to the same drifted PCRs ask once.
 	if !plan.state.is_empty() && decided.declined(&plan.state) {
 		notice!(
 			"volume {volume:?}: leaving the header alone: re-enrollment was already declined for this boot state"
@@ -516,7 +484,7 @@ fn maybe_reenroll(
 		secret,
 	) {
 		// systemd-cryptenroll adds the new slot before wiping the old one and
-		// never wipes the slot it just added, so a failure here leaves the old
+		// never wipes the slot it just added, so a failure leaves the old
 		// binding, the new one, or both -- and the passphrase either way.
 		error!("volume {volume:?}: re-enrollment failed ({e}); the volume still unlocks by passphrase");
 		return;
@@ -525,10 +493,9 @@ fn maybe_reenroll(
 	verify(volume, config, &plan, &mut tpm);
 }
 
-/// Section 4.3: check the new slot before trusting it.
-///
-/// The old slot is gone by now, so a failure here is worth saying loudly -- but
-/// it is not a disaster, because the passphrase slot was never involved.
+/// Check the new slot before trusting it. The old slot is gone by now, so a
+/// failure is worth saying loudly -- though the passphrase slot was never
+/// involved, so it is not a disaster.
 fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2::Tpm) {
 	let tokens = match token::read(&config.device) {
 		Ok(t) => t,
@@ -545,8 +512,8 @@ fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2:
 		return;
 	};
 
-	// The real thing first: --token-only refuses to fall back to a passphrase,
-	// so success is a TPM2 unseal and nothing else.
+	// --token-only refuses to fall back to a passphrase, so success here is a
+	// TPM2 unseal and nothing else.
 	match enroll::test_unseal(&config.device, new.index) {
 		Ok(()) => {
 			notice!("volume {volume:?}: re-enrolled as token {} and verified by unsealing it", new.index);
@@ -558,11 +525,11 @@ fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2:
 	}
 
 	// Reached whenever libcryptsetup cannot load the systemd-tpm2 token plugin:
-	// an initrd trimmed of it, or simply nixpkgs, which ships the plugin in
-	// systemd's output rather than in cryptsetup's plugin directory. Comparing
-	// the sealed policy against the current PCRs is weaker -- it would not
-	// notice an unusable SRK -- but it covers the failure this tool can actually
-	// cause, which is sealing against the wrong state.
+	// a trimmed initrd, or simply nixpkgs, which ships the plugin in systemd's
+	// output rather than cryptsetup's plugin directory. Comparing the sealed
+	// policy against the current PCRs is weaker -- it would not notice an
+	// unusable SRK -- but it covers the failure this tool can cause, which is
+	// sealing against the wrong state.
 	match drift::check(tpm, new) {
 		Drift::Matches => notice!(
 			"volume {volume:?}: re-enrolled as token {}, and its policy matches the current PCRs",
@@ -579,17 +546,16 @@ fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2:
 
 /// Produce a passphrase that is known to open `config.device`.
 ///
-/// The cache is consulted first (DESIGN.md section 5): with several volumes
-/// sharing a passphrase, only the first of them prompts. Every candidate,
-/// cached or freshly typed, is validated before it is returned -- which is
-/// precisely what makes it safe to accept a secret we did not watch the user
-/// type.
+/// The cache is consulted first, so with several volumes sharing a passphrase
+/// only the first prompts. Every candidate, cached or freshly typed, is
+/// validated before it is returned -- which is what makes it safe to accept a
+/// secret we did not watch the user type.
 fn acquire(volume: &str, config: &Volume, cache: &mut Cache) -> Option<Secret> {
 	let device = config.device.as_str();
 
 	if !cache.is_empty() {
-		// Worth a line: each trial is a full KDF pass, so this is where a
-		// multi-second pause before the prompt comes from.
+		// Each trial is a full KDF pass, so this line explains a multi-second
+		// pause before the prompt.
 		info!(
 			"volume {volume:?}: trying {} passphrase(s) seen earlier this boot",
 			cache.len()
@@ -648,9 +614,8 @@ fn acquire(volume: &str, config: &Volume, cache: &mut Cache) -> Option<Secret> {
 	None
 }
 
-/// Hand the passphrase back verbatim: these bytes go straight to
-/// `crypt_activate_by_passphrase()`, so a stray newline is a rejected
-/// passphrase.
+/// Verbatim: these bytes go straight to `crypt_activate_by_passphrase()`, so a
+/// stray newline is a rejected passphrase.
 fn reply(conn: OwnedFd, volume: &str, secret: &Secret) {
 	match write_all(&conn, secret.as_bytes()) {
 		Ok(()) => info!(

@@ -9,32 +9,26 @@
 //!
 //! with RANDOM an alphanumeric string (a hex `u64` in practice). systemd varies
 //! the infix according to what it is asking for, and that infix is the only
-//! signal we get about which phase of the unlock loop we are being consulted
-//! in. See `make_bindname()`, src/cryptsetup/cryptsetup.c:1373.
+//! signal we get about which phase of the unlock loop we are in. See
+//! `make_bindname()`, src/cryptsetup/cryptsetup.c:1373.
 //!
-//! The name is recovered with `getpeername(2)`, and the important property of
-//! the bytes it returns is that they are *not* NUL-terminated: the leading NUL
-//! marks the abstract namespace, and the length comes from the returned
-//! `addrlen`. Reading them as a C string yields an empty name and mis-dispatches
-//! every connection, so everything here works on byte slices with an explicit
-//! length.
+//! The bytes `getpeername(2)` returns are *not* NUL-terminated: the leading NUL
+//! marks the abstract namespace, and the length comes from `addrlen`. Reading
+//! them as a C string yields an empty name and mis-dispatches every connection,
+//! so everything here works on byte slices with an explicit length.
 
 /// Which phase of systemd-cryptsetup's retry loop a connection belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-	/// The real passphrase is wanted. For a volume we manage this is reached
-	/// only after the TPM2 attempt has already failed, which is what makes it
-	/// our cue that the binding has drifted.
+	/// The real passphrase. Reached only after the TPM2 attempt has already
+	/// failed, which is what makes it our cue that the binding has drifted.
 	Plain,
-	/// The *encrypted* TPM2 blob is wanted. Declining here with zero bytes is
-	/// what lets the LUKS2 header token be consulted normally.
+	/// The *encrypted* TPM2 blob. Declining here with zero bytes is what lets
+	/// the LUKS2 header token be consulted normally.
 	Tpm2,
-	/// The FIDO2 salt is wanted.
 	Fido2Salt,
-	/// The PKCS#11 encrypted key is wanted.
 	Pkcs11,
-	/// An infix this build does not recognise. Treated exactly like the other
-	/// non-plain phases: declined.
+	/// An infix this build does not recognise. Declined like the others.
 	Unknown,
 }
 
@@ -50,8 +44,7 @@ impl Phase {
 	}
 }
 
-/// The infixes systemd uses, longest-distinguishing first. None is a prefix of
-/// another, so match order is not load-bearing.
+/// None is a prefix of another, so match order is not load-bearing.
 const INFIXES: &[(&[u8], Phase)] = &[
 	(b"/cryptsetup/", Phase::Plain),
 	(b"/cryptsetup-tpm2/", Phase::Tpm2),
@@ -59,29 +52,24 @@ const INFIXES: &[(&[u8], Phase)] = &[
 	(b"/cryptsetup-pkcs11/", Phase::Pkcs11),
 ];
 
-/// A successfully parsed peer name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerName<'a> {
 	pub phase: Phase,
-	/// The volume component, which we cross-check against the volume the
-	/// listening socket is bound for.
+	/// Cross-checked against the volume the listening socket is bound for.
 	pub volume: &'a [u8],
 }
 
 /// Parse an abstract socket name *without* its leading NUL byte.
 ///
-/// Returns `None` when the name does not have the documented shape at all, as
-/// distinct from having an unrecognised infix -- the latter parses fine and
-/// yields [`Phase::Unknown`]. Both outcomes lead to a decline; they are kept
-/// apart only so the logs say which happened.
+/// `None` means the name does not have the documented shape at all, as distinct
+/// from having an unrecognised infix, which parses fine and yields
+/// [`Phase::Unknown`]. Both decline; they are kept apart only for the logs.
 pub fn parse(name: &[u8]) -> Option<PeerName<'_>> {
-	// The random prefix runs up to the first slash.
 	let slash = name.iter().position(|&b| b == b'/')?;
 	let (random, rest) = name.split_at(slash);
 
-	// crypttab(5) promises alphanumeric. Enforcing it means a name that does
-	// not come from systemd-cryptsetup is rejected outright rather than being
-	// coerced into a phase.
+	// crypttab(5) promises alphanumeric. Enforcing it means a name that did not
+	// come from systemd-cryptsetup is rejected rather than coerced into a phase.
 	if random.is_empty() || !random.iter().all(u8::is_ascii_alphanumeric) {
 		return None;
 	}
@@ -95,8 +83,8 @@ pub fn parse(name: &[u8]) -> Option<PeerName<'_>> {
 		}
 	}
 
-	// Unrecognised infix. Recover the volume for the log line: device-mapper
-	// names cannot contain a slash, so the last component is the volume.
+	// Recover the volume for the log line: device-mapper names cannot contain a
+	// slash, so the last component is the volume.
 	let last = rest.iter().rposition(|&b| b == b'/')?;
 	let volume = &rest[last + 1..];
 	if volume.is_empty() {
@@ -149,9 +137,8 @@ mod tests {
 
 	#[test]
 	fn tpm2_infix_is_not_read_as_plain() {
-		// "/cryptsetup-tpm2/" shares a prefix with "/cryptsetup" but not with
-		// "/cryptsetup/". Confusing the two would hand the passphrase to the
-		// phase that wants an encrypted blob.
+		// Confusing the two would hand the passphrase to the phase that wants an
+		// encrypted blob.
 		let input = "abc123/cryptsetup-tpm2/root";
 		let actual = phase_of(input);
 		assert_eq!(
@@ -193,8 +180,7 @@ mod tests {
 
 	#[test]
 	fn a_retained_leading_nul_fails_closed() {
-		// Callers pass the abstract name with its leading NUL already removed.
-		// If that ever stops being true -- rustix changing what
+		// If callers ever stop stripping the leading NUL -- rustix changing what
 		// `abstract_name()` returns, say -- we want a decline, not a phase
 		// guessed from a name we misread.
 		let input = "\0abc123/cryptsetup/root";
@@ -208,8 +194,7 @@ mod tests {
 	#[test]
 	fn trailing_nul_padding_fails_closed() {
 		// Likewise if we were ever handed the fixed-size sun_path buffer rather
-		// than addrlen bytes of it. A volume name with NULs glued on is not a
-		// volume we serve, and declining is the safe reading.
+		// than addrlen bytes of it.
 		let input = "abc123/cryptsetup/root\0\0\0";
 		let volume = volume_of(input);
 		assert_ne!(

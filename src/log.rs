@@ -1,12 +1,9 @@
-//! Minimal logging to stderr.
+//! Minimal logging to stderr, which for a systemd service is the journal.
 //!
-//! The daemon runs as a systemd service, so stderr is the journal. Lines are
-//! prefixed with the syslog level markers sd-daemon(3) defines (`<3>` for
-//! error, and so on); journald strips them and sets the priority, because
-//! `SyslogLevelPrefix=` defaults to yes.
-//!
-//! Deliberately hand-rolled rather than pulling in `log` plus a backend: this
-//! binary is bound for an initrd, where every dependency is closure size.
+//! Lines carry the syslog level markers sd-daemon(3) defines; journald strips
+//! them and sets the priority, because `SyslogLevelPrefix=` defaults to yes.
+//! Hand-rolled rather than `log` plus a backend because this binary is bound for
+//! an initrd, where every dependency is closure size.
 
 use std::io::Write;
 

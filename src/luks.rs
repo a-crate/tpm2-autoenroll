@@ -1,16 +1,13 @@
 //! Checking a passphrase against a LUKS2 volume.
 //!
-//! Validation is what makes everything else in the plain phase safe. DESIGN.md
-//! section 2.3 gives us exactly one attempt before systemd-cryptsetup reverts to
-//! its own prompt, so a passphrase we did not check -- one typed with a typo, or
-//! one pulled from the kernel keyring where it was cached for some entirely
-//! different volume -- would spend that attempt for nothing. Section 6 needs it
-//! too: consent must be asked only after the passphrase is known to be right, so
-//! a typo never produces a consent prompt.
+//! Validation is what makes everything else in the plain phase safe. We get
+//! exactly one attempt before systemd-cryptsetup reverts to its own prompt, so
+//! an unchecked passphrase -- a typo, or one pulled from the kernel keyring
+//! where it was cached for an entirely different volume -- would spend that
+//! attempt for nothing. It also keeps a typo from producing a consent prompt.
 //!
 //! Done by running the `cryptsetup` CLI rather than linking libcryptsetup, which
-//! would forfeit the static musl build section 9 asks for. The cost is one full
-//! KDF pass per check (DESIGN.md section 4.4).
+//! would forfeit the static musl build. The cost is one full KDF pass per check.
 
 use std::process::{Command, Stdio};
 
@@ -19,20 +16,17 @@ use crate::secret::Secret;
 
 const BINARY: &str = "cryptsetup";
 
-/// What a passphrase turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-	/// It opens the volume.
 	Correct,
-	/// It does not. A typo, or a passphrase belonging to another volume; either
-	/// way, asking again is the right response.
+	/// A typo, or a passphrase belonging to another volume; either way, asking
+	/// again is the right response.
 	Wrong,
 	/// We could not tell -- a missing device, a broken config, no permission.
 	/// Distinct from `Wrong` because retrying would loop forever.
 	Unusable(String),
 }
 
-/// Does `secret` unlock `device`?
 pub fn test_passphrase(device: &str, secret: &Secret) -> Verdict {
 	let key = match SecretFile::new(secret) {
 		Ok(k) => k,
@@ -41,16 +35,14 @@ pub fn test_passphrase(device: &str, secret: &Secret) -> Verdict {
 
 	let mut cmd = Command::new(BINARY);
 	cmd.arg("open")
-		// No device-mapper node is created and no name is needed; this only
-		// runs the passphrase through the KDF and compares.
 		.arg("--test-passphrase")
 		.arg("--batch-mode")
 		// Both of these keep the answer a statement about the passphrase
 		// specifically. A LUKS2 token plugin, or a volume key already in the
-		// kernel keyring, could otherwise open the volume and report success
-		// for a passphrase that is in fact wrong -- and on this path the TPM2
-		// token has just failed, so that is exactly the wrong thing to believe
-		// at exactly the wrong moment.
+		// kernel keyring, could otherwise open the volume and report success for
+		// a passphrase that is in fact wrong -- and on this path the TPM2 token
+		// has just failed, so that is the wrong thing to believe at the wrong
+		// moment.
 		.arg("--disable-external-tokens")
 		.arg("--disable-keyring")
 		.arg(format!("--key-file={}", key.path()))
@@ -79,12 +71,9 @@ pub fn test_passphrase(device: &str, secret: &Secret) -> Verdict {
 	}
 }
 
-/// cryptsetup(8) RETURN CODES: 0 success, 1 wrong parameters, 2 no permission
-/// (bad passphrase), 3 out of memory, 4 wrong device, 5 device busy.
-///
-/// Only 2 means "that passphrase is not one of this volume's". Everything else
-/// is our problem rather than the user's, and must not be answered by prompting
-/// again.
+/// cryptsetup(8) RETURN CODES. Only 2 means "that passphrase is not one of this
+/// volume's"; everything else is our problem rather than the user's, and must
+/// not be answered by prompting again.
 fn verdict_from_code(code: Option<i32>) -> Verdict {
 	match code {
 		Some(0) => Verdict::Correct,
@@ -116,9 +105,8 @@ mod tests {
 
 	#[test]
 	fn everything_but_zero_and_two_is_unusable() {
-		// The distinction that matters: Unusable must never be retried, because
-		// a device that does not exist will not start existing because we asked
-		// the user to type the passphrase again.
+		// Unusable must never be retried: a device that does not exist will not
+		// start existing because we asked the user to type it again.
 		for input in [Some(1), Some(3), Some(4), Some(5), Some(99), None] {
 			let actual = verdict_from_code(input);
 			assert!(
@@ -130,8 +118,6 @@ mod tests {
 
 	#[test]
 	fn a_bad_passphrase_is_not_reported_as_a_broken_device() {
-		// Confusing these two either loops forever on a typo or gives up
-		// instantly on a correct passphrase.
 		let actual = verdict_from_code(Some(2));
 		assert_eq!(
 			actual,

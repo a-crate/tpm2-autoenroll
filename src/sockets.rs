@@ -2,39 +2,31 @@
 //!
 //! `discover_key()` (cryptsetup.c:2562) searches `/etc/cryptsetup-keys.d` then
 //! `/run/cryptsetup-keys.d` for `<volume>.key`, and connects to it if it is a
-//! socket. We bind those sockets ourselves rather than having systemd do it
-//! through `ListenStream=`, because the set of volumes is not known until the
-//! crypttab has been read, and a socket unit's listen list is fixed at build
-//! time.
-//!
-//! The daemon therefore owns the sockets' whole lifetime, including removing
-//! them on the way out (`main::shutdown`). A socket file left behind in /run
-//! outlives switch-root and sits exactly where stage 2's systemd-cryptsetup
-//! looks, with nobody listening on it.
+//! socket. We bind those sockets ourselves rather than through `ListenStream=`,
+//! because the set of volumes is not known until the crypttab has been read and
+//! a socket unit's listen list is fixed at build time. The daemon therefore owns
+//! their whole lifetime, including removing them on the way out
+//! (`main::shutdown`).
 
 use std::os::fd::OwnedFd;
 
 use rustix::fs::{FileType, Mode};
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 
-/// Where the sockets go. /run rather than /etc because they exist only for as
-/// long as the daemon does.
+/// /run rather than /etc because the sockets exist only as long as the daemon.
 pub const DEFAULT_DIR: &str = "/run/cryptsetup-keys.d";
 
-/// systemd-cryptsetup connects once per volume and we answer serially, so the
-/// backlog only has to absorb several volumes unlocking at once.
+/// We answer serially, so this only has to absorb several volumes unlocking at
+/// once.
 const BACKLOG: i32 = 16;
 
 pub fn path(dir: &str, volume: &str) -> String {
 	format!("{dir}/{volume}.key")
 }
 
-/// Create the directory the sockets live in.
-///
-/// 0700: the sockets under it hand out passphrases, and the directory mode is
-/// the cheap half of keeping that to root. An existing directory is left as it
-/// is -- on a system-stage boot systemd-cryptsetup may have created it already,
-/// and fighting over the mode of a directory we did not make is not our business.
+/// 0700, because the sockets under it hand out passphrases. An existing
+/// directory is left as it is: on a system-stage boot systemd-cryptsetup may
+/// have created it, and fighting over its mode is not our business.
 pub fn ensure_dir(dir: &str) -> Result<(), String> {
 	match rustix::fs::mkdir(dir, Mode::RWXU) {
 		Ok(()) => {
@@ -46,7 +38,6 @@ pub fn ensure_dir(dir: &str) -> Result<(), String> {
 	}
 }
 
-/// Bind and listen on one volume's key socket.
 pub fn bind(path: &str) -> Result<OwnedFd, String> {
 	clear(path)?;
 
@@ -67,11 +58,9 @@ pub fn bind(path: &str) -> Result<OwnedFd, String> {
 	Ok(fd)
 }
 
-/// Remove a socket we are about to replace, or have finished with.
-///
-/// Only ever a socket. Anything else at that path is a real key file someone
-/// put there deliberately -- systemd-cryptsetup reads those as well -- and
-/// deleting it would destroy the very thing it is looking for.
+/// Only ever a socket. Anything else at that path is a real key file someone put
+/// there deliberately -- systemd-cryptsetup reads those too -- and deleting it
+/// would destroy the very thing it is looking for.
 pub fn clear(path: &str) -> Result<(), String> {
 	let stat = match rustix::fs::lstat(path) {
 		Ok(s) => s,
@@ -120,8 +109,7 @@ mod tests {
 			mode & 0o777
 		);
 
-		// Rebinding is what a second run of the daemon does, and it must not
-		// need a hand-cleaned /run to work.
+		// A second run of the daemon must not need a hand-cleaned /run to work.
 		drop(fd);
 		bind(&p).unwrap_or_else(|e| panic!("rebinding {p:?} returned Err({e}), expected Ok"));
 

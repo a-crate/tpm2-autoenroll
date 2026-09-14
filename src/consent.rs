@@ -1,5 +1,4 @@
-//! The consent prompt, which DESIGN.md section 6 makes mandatory and section 6.1
-//! explains at length why there is no way to switch off.
+//! The consent prompt. Mandatory, with no way to switch it off.
 //!
 //! Automatic re-enrollment blesses whatever boot chain is currently running.
 //! Normally an unexpected passphrase prompt *is* the evil-maid signal, and this
@@ -7,21 +6,17 @@
 //! signal a modified boot chain cannot forge, so it is asked every time and the
 //! answer is never inferred, remembered across boots, or configured away.
 //!
-//! Two details separate this from the passphrase prompt in `askpw`:
-//!
-//!   * `--echo=yes`. The answer is not a secret and the user should see what
-//!     they typed.
-//!   * no `--keyname=`. Pushing "y" into the `cryptsetup` keyring would leave it
-//!     sitting there as a candidate passphrase for the next volume.
+//! Unlike the passphrase prompt in `askpw` this passes `--echo=yes`, since the
+//! answer is not a secret, and no `--keyname=`, since pushing "y" into the
+//! `cryptsetup` keyring would leave it there as a candidate passphrase.
 
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 
 const BINARY: &str = "systemd-ask-password";
 
-/// Decision state for a given PCR set.
-/// If the user says "don't enroll this", always skip enrollment.
-/// If the user says "always enroll this", always do enrollemnt.
+/// Answers already given, keyed by PCR set, so volumes sharing a boot state ask
+/// once.
 #[derive(Default)]
 pub struct Decisions {
 	declines: HashSet<Vec<u8>>,
@@ -58,12 +53,10 @@ pub enum Answer {
     Always,
 }
 
-/// Ask whether to re-enroll `volume`, and return what the human said.
-///
 /// Anything that is not an explicit yes is a no, including a timeout, a closed
-/// prompt, or an agent that failed outright. The failure mode of declining is
-/// that the volume stays in passphrase-only mode and the boot continues; the
-/// failure mode of assuming yes is re-binding to an attacker's boot chain.
+/// prompt, or an agent that failed outright. Declining leaves the volume in
+/// passphrase-only mode and the boot continues; assuming yes would re-bind to
+/// an attacker's boot chain.
 pub fn ask(volume: &str, device: &str) -> Answer {
 	let message = format!(
 		"Boot measurements for {volume} have changed since TPM2 enrollment. \
@@ -73,8 +66,8 @@ pub fn ask(volume: &str, device: &str) -> Answer {
 	let out = Command::new(BINARY)
 		.arg("--icon=drive-harddisk")
 		.arg("--emoji=yes")
-		// A distinct id from the passphrase prompt for the same disk, so an
-		// agent cannot mistake one question for a repeat of the other.
+		// Distinct from the passphrase prompt's id for the same disk, so an agent
+		// cannot mistake one question for a repeat of the other.
 		.arg(format!("--id=tpm2-autoenroll:{device}"))
 		.arg("--echo=yes")
 		.arg("-n")
@@ -106,12 +99,11 @@ pub fn ask(volume: &str, device: &str) -> Answer {
 
 fn classify_response(answer: &[u8]) -> Answer {
 	let text = String::from_utf8_lossy(answer);
-	// `--multiple` is not passed, but an agent may still terminate its reply
-	// with a newline, and a user may well hit space before return.
+	// An agent may terminate its reply with a newline, and a user may well hit
+	// space before return.
 	let first = text.lines().next().unwrap_or("").trim();
-	// The prompt spells the options out as "y(es)/n(o)/a(lways)", so both
-	// spellings of each have to work. Nothing else does: an answer we do not
-	// recognise is a refusal.
+	// Both spellings of each option have to work; anything unrecognised is a
+	// refusal.
 	match first.to_ascii_lowercase().as_str() {
 		"y" | "yes" => Answer::Yes,
 		"a" | "always" => Answer::Always,
@@ -181,8 +173,6 @@ mod tests {
 
 	#[test]
 	fn an_accept_covers_an_identical_boot_state() {
-		// Two volumes bound to the same PCRs with the same values produce the
-		// same key, so one refusal answers for both.
 		let mut accepted = Decisions::new();
 		accepted.accept(&[0xaa; 32]);
 

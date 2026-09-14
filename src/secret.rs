@@ -2,18 +2,15 @@
 //!
 //! Passphrases are bytes, not text: nothing guarantees a user's passphrase is
 //! valid UTF-8, and systemd-cryptsetup passes whatever it reads straight to
-//! libcryptsetup. Keeping secrets in `Vec<u8>` rather than `String` avoids both
-//! a lossy conversion and the reallocation a `String` would do to fix one up.
+//! libcryptsetup. `Vec<u8>` rather than `String` avoids a lossy conversion.
 
 use std::fmt;
 
 use zeroize::Zeroize;
 
-/// Key material that is wiped when dropped and never rendered by `Debug`.
-///
-/// This is the only type a passphrase is allowed to live in. Introducing it up
-/// front is deliberate: secret hygiene retrofitted later is how secrets end up
-/// in log lines.
+/// Key material that is wiped when dropped and never rendered by `Debug`. The
+/// only type a passphrase is allowed to live in, because secret hygiene
+/// retrofitted later is how secrets end up in log lines.
 pub struct Secret(Vec<u8>);
 
 impl Secret {
@@ -40,17 +37,17 @@ impl Drop for Secret {
 	}
 }
 
-/// Written out rather than derived, because `Drop` rules a derive out anyway and
-/// because copying a secret should be a visible act.
+/// Written out rather than derived: `Drop` rules a derive out anyway, and
+/// copying a secret should be a visible act.
 impl Clone for Secret {
 	fn clone(&self) -> Self {
 		Secret(self.0.clone())
 	}
 }
 
-/// Used only to keep the in-process cache free of duplicates. Plain byte
-/// equality: both operands are already in this process's address space, held by
-/// a root daemon, so a constant-time comparison would protect against nothing.
+/// Deduplicates the in-process cache. Plain byte equality: both operands are
+/// already in this root daemon's address space, so a constant-time comparison
+/// would protect against nothing.
 impl PartialEq for Secret {
 	fn eq(&self, other: &Self) -> bool {
 		self.0 == other.0
@@ -59,8 +56,8 @@ impl PartialEq for Secret {
 
 impl Eq for Secret {}
 
-/// Renders as a redaction, so a `Secret` reached by an accidental `{:?}` on some
-/// enclosing struct cannot leak the passphrase into the journal.
+/// A redaction, so a `Secret` reached by an accidental `{:?}` on an enclosing
+/// struct cannot leak the passphrase into the journal.
 impl fmt::Debug for Secret {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "Secret({} bytes)", self.0.len())

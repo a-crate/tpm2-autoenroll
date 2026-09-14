@@ -1,12 +1,10 @@
 //! Handing a secret to a child process without it appearing anywhere a third
 //! party can read.
 //!
-//! DESIGN.md section 4.2 requires this for `systemd-cryptenroll`: not argv,
-//! which is world-readable in `/proc`, and not the environment, which is
-//! readable for the lifetime of the process by anyone who can read
-//! `/proc/<pid>/environ`. A memfd has no name in any filesystem, is reachable
-//! only through the holder's own `/proc/self/fd`, and disappears when the last
-//! descriptor closes.
+//! Not argv, which is world-readable in `/proc`, and not the environment, which
+//! anyone who can read `/proc/<pid>/environ` gets for the process's lifetime. A
+//! memfd has no name in any filesystem, is reachable only through the holder's
+//! own `/proc/self/fd`, and disappears when the last descriptor closes.
 //!
 //! `cryptsetup --key-file=` and `systemd-cryptenroll --unlock-key-file=` both
 //! read the file verbatim -- cryptsetup(8) is explicit that newlines do not
@@ -20,7 +18,6 @@ use std::process::Command;
 
 use crate::secret::Secret;
 
-/// A secret living in an anonymous file, ready to be named to a child.
 pub struct SecretFile {
 	fd: OwnedFd,
 }
@@ -42,16 +39,14 @@ impl SecretFile {
 	/// The path to hand the child.
 	///
 	/// `/proc/self/fd/<n>` resolves in the *child's* fd table, which is why
-	/// [`Self::attach`] has to run first: the number is ours, and it only
-	/// survives the exec because we clear `FD_CLOEXEC` on it after the fork.
-	/// Opening the link re-opens the memfd at offset zero, so the same
-	/// `SecretFile` can be handed to several children in turn.
+	/// [`Self::attach`] has to run first: the number is ours, and only survives
+	/// the exec because we clear `FD_CLOEXEC` after the fork. Opening the link
+	/// re-opens the memfd at offset zero, so the same `SecretFile` can be handed
+	/// to several children in turn.
 	pub fn path(&self) -> String {
 		format!("/proc/self/fd/{}", self.fd.as_raw_fd())
 	}
 
-	/// Arrange for this fd to survive `exec` in `cmd`, and only in `cmd`.
-	///
 	/// Clearing `FD_CLOEXEC` in the parent would leak the key into every
 	/// subsequent child, including `systemd-ask-password`. Doing it in the
 	/// pre-exec hook confines it to this one process.
@@ -91,9 +86,9 @@ mod tests {
 
 	#[test]
 	fn reading_twice_gives_the_same_bytes() {
-		// Each open of the procfs link starts at offset zero. If it did not,
-		// the second child to be handed the same SecretFile would read nothing
-		// and report a wrong passphrase.
+		// If each open of the procfs link did not start at offset zero, the
+		// second child handed the same SecretFile would read nothing and report
+		// a wrong passphrase.
 		let secret = Secret::new(b"hunter2".to_vec());
 		let file = SecretFile::new(&secret).expect("SecretFile::new returned Err, expected Ok");
 		let _ = std::fs::read(file.path()).expect("the first read returned Err");

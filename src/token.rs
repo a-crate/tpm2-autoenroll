@@ -2,8 +2,7 @@
 //!
 //! This is where the enrollment's own parameters live: which PCRs it was sealed
 //! against, in which bank, and the policy digest that sealing produced. Nothing
-//! else knows them -- the daemon's config says which PCRs we would enroll
-//! *next* time, which is a different question from what is on the disk now.
+//! else knows them.
 //!
 //! Obtained from `cryptsetup luksDump --dump-json-metadata`, whose output is the
 //! header's JSON verbatim. The field names below are systemd's, from
@@ -20,17 +19,14 @@ const BINARY: &str = "cryptsetup";
 /// A `systemd-tpm2` token as it sits in the header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tpm2Token {
-	/// The token's index in the header, which is what `--wipe-slot=` and any
-	/// later diffing need.
 	pub index: u32,
-	/// PCR indices the policy covers. May be empty: an enrollment against no
-	/// PCRs at all is legal and unlocks unconditionally.
+	/// May be empty: an enrollment against no PCRs at all is legal and unlocks
+	/// unconditionally.
 	pub pcrs: Vec<u8>,
-	/// The bank name, e.g. `sha256`. Absent in very old enrollments.
+	/// e.g. `sha256`. Absent in very old enrollments.
 	pub bank: Option<String>,
-	/// The sealed policy digest, which is what a drift check compares against.
+	/// What a drift check compares against.
 	pub policy_hash: Vec<u8>,
-	/// Whether unsealing additionally requires a PIN.
 	pub pin: bool,
 	/// A signed-PCR-policy or pcrlock enrollment. We can neither judge nor
 	/// reproduce these, and must not wipe them.

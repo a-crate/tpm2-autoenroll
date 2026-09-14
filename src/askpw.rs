@@ -2,15 +2,14 @@
 //!
 //! Going through the same tool systemd-cryptsetup uses means the prompt reaches
 //! whichever agent owns the console (plymouth, the tty agent, a wall agent) with
-//! no work on our part, and means the kernel keyring cache behaves identically.
-//! See `get_password()`, src/cryptsetup/cryptsetup.c:911.
+//! no work on our part, and the kernel keyring cache behaves identically. See
+//! `get_password()`, src/cryptsetup/cryptsetup.c:911.
 //!
-//! Both halves of DESIGN.md section 3.2's `ASK_PASSWORD_ACCEPT_CACHED |
-//! ASK_PASSWORD_PUSH_CACHE` are now in play: `--keyname=` pushes what we collect
-//! into the `cryptsetup` keyring, and `--accept-cached` takes what is already
-//! there. Accepting is only safe because every candidate is now checked against
-//! the volume before it is used (`luks::test_passphrase`) -- a cached passphrase
-//! may well belong to some unrelated volume unlocked earlier in the same boot.
+//! `--keyname=` pushes what we collect into the `cryptsetup` keyring and
+//! `--accept-cached` takes what is already there. Accepting is only safe
+//! because every candidate is checked against the volume before it is used
+//! (`luks::test_passphrase`) -- a cached passphrase may well belong to some
+//! unrelated volume unlocked earlier in the same boot.
 
 use std::process::{Command, Stdio};
 
@@ -20,42 +19,36 @@ const BINARY: &str = "systemd-ask-password";
 
 /// How many candidates from one prompt we are willing to try.
 ///
-/// `--multiple` can return every passphrase cached this boot, and each one we
-/// reject costs a full KDF pass -- seconds and up to a gigabyte with argon2id
-/// (DESIGN.md section 4.4). Past a handful, asking the user is cheaper than
-/// guessing.
+/// `--multiple` can return every passphrase cached this boot, and each rejection
+/// costs a full KDF pass -- seconds and up to a gigabyte with argon2id. Past a
+/// handful, asking the user is cheaper than guessing.
 const MAX_CANDIDATES: usize = 4;
 
-/// Which time round this is.
-///
-/// The distinction is not cosmetic. A retry must *not* accept cached
-/// passphrases: the cached one is what we just rejected, and asking for it again
-/// would spin the retry loop without the user ever being given a chance to type.
+/// A retry must *not* accept cached passphrases: the cached one is what we just
+/// rejected, and asking for it again would spin the retry loop without the user
+/// ever being given a chance to type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attempt {
 	First,
 	Retry,
 }
 
-/// Prompt for the passphrase of `volume`, whose header lives on `device`.
-///
-/// Returns every candidate the agent offered, in the order offered. The caller
-/// is expected to validate them; nothing here knows whether any of them is
-/// right.
+/// Every candidate the agent offered, in the order offered. The caller is
+/// expected to validate them; nothing here knows whether any is right.
 pub fn ask(volume: &str, device: &str, attempt: Attempt) -> Result<Vec<Secret>, String> {
 	let friendly = friendly_name(volume, device);
 
 	let mut cmd = Command::new(BINARY);
 	cmd.arg("--icon=drive-harddisk")
 		// systemd-cryptsetup identifies the request by the cescaped backing
-		// device, not the volume name. Matching it exactly is what lets a
-		// console agent recognise our request as being about the same disk.
+		// device, not the volume name. Matching it exactly lets a console agent
+		// recognise our request as being about the same disk.
 		.arg(format!("--id=cryptsetup:{}", cescape(device)))
 		.arg("--keyname=cryptsetup")
 		.arg("--credential=cryptsetup.passphrase")
-		// Ask for every candidate rather than just the first. Without this,
-		// --accept-cached hands back one cached entry, and if that one belongs
-		// to another volume it masks the entry that would have worked.
+		// Without this, --accept-cached hands back one cached entry, and if that
+		// one belongs to another volume it masks the entry that would have
+		// worked.
 		.arg("--multiple")
 		.arg("-n");
 
@@ -76,7 +69,7 @@ pub fn ask(volume: &str, device: &str, attempt: Attempt) -> Result<Vec<Secret>, 
 		.map_err(|e| format!("could not run {BINARY}: {e}"))?;
 
 	// A timeout is reported this way too, and declining on it is right: the
-	// prompt reverts to systemd-cryptsetup, which applies its own.
+	// prompt reverts to systemd-cryptsetup, which applies its own timeout.
 	if !out.status.success() {
 		return Err(format!("{BINARY} exited with {}", out.status));
 	}
@@ -88,12 +81,10 @@ pub fn ask(volume: &str, device: &str, attempt: Attempt) -> Result<Vec<Secret>, 
 	Ok(candidates)
 }
 
-/// Split `systemd-ask-password` output into candidates.
-///
 /// With `--multiple` the passphrases are newline-separated, and `-n` suppresses
 /// only the final newline. Splitting is lossless because a passphrase cannot
-/// contain a newline in the first place: agents deliver them as datagrams and
-/// the keyring stores them NUL-separated, so there is nowhere for one to survive.
+/// contain a newline: agents deliver them as datagrams and the keyring stores
+/// them NUL-separated, so there is nowhere for one to survive.
 fn parse_candidates(stdout: &[u8]) -> Vec<Secret> {
 	stdout
 		.split(|&b| b == b'\n')
@@ -103,8 +94,6 @@ fn parse_candidates(stdout: &[u8]) -> Vec<Secret> {
 		.collect()
 }
 
-/// What systemd would call this disk in a prompt, near enough.
-///
 /// Cosmetic, unlike the id: this is the text a human reads.
 fn friendly_name(volume: &str, device: &str) -> String {
 	format!("{device} ({volume})")
@@ -112,10 +101,9 @@ fn friendly_name(volume: &str, device: &str) -> String {
 
 /// systemd's `cescape()`, src/basic/escape.c.
 ///
-/// Only the id uses it, and a device path normally passes through untouched --
-/// but a device whose name contained a quote or a control character would
-/// otherwise produce an id systemd would never generate, which defeats the point
-/// of matching systemd's id at all.
+/// A device path normally passes through untouched, but one whose name held a
+/// quote or a control character would otherwise produce an id systemd would
+/// never generate, defeating the point of matching systemd's id at all.
 fn cescape(s: &str) -> String {
 	let mut out = String::with_capacity(s.len());
 	for b in s.bytes() {
@@ -130,9 +118,8 @@ fn cescape(s: &str) -> String {
 			b'\\' => out.push_str("\\\\"),
 			b'"' => out.push_str("\\\""),
 			b'\'' => out.push_str("\\'"),
-			// Printable ASCII only. Anything else, including every byte of a
-			// UTF-8 sequence, becomes \xNN -- which is what systemd does, since
-			// it applies isprint(3) in the C locale byte by byte.
+			// Anything else, including every byte of a UTF-8 sequence, becomes
+			// \xNN: systemd applies isprint(3) in the C locale byte by byte.
 			0x20..=0x7e => out.push(b as char),
 			_ => out.push_str(&format!("\\x{b:02x}")),
 		}
@@ -175,8 +162,6 @@ mod tests {
 
 	#[test]
 	fn a_trailing_newline_does_not_become_an_empty_passphrase() {
-		// An empty candidate would cost a KDF pass to reject, and on a volume
-		// enrolled with an empty passphrase it would be worse than that.
 		let input = b"only\n".as_slice();
 		let actual = candidates(input);
 		let expected = vec![b"only".to_vec()];
@@ -226,8 +211,6 @@ mod tests {
 			("a\tb", "a\\tb"),
 			("a\nb", "a\\nb"),
 			("a\u{1}b", "a\\x01b"),
-			// Non-ASCII is escaped byte by byte: isprint(3) in the C locale is
-			// false for every byte of a UTF-8 sequence.
 			("dé", "d\\xc3\\xa9"),
 		];
 		for (input, expected) in cases {

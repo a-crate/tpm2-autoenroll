@@ -1,40 +1,30 @@
 //! Has the boot state actually moved away from what the volume was sealed
 //! against?
 //!
-//! This is the last and most interesting of DESIGN.md section 4.1's preflight
-//! checks. Being asked for a passphrase tells us the TPM2 unlock failed; it does
-//! not tell us *why*. Re-enrolling fixes a policy whose PCRs have drifted and
-//! fixes nothing else, so without this check a volume failing for an unrelated
-//! reason would have its header rewritten on every single boot.
+//! The last and most interesting preflight check. Being asked for a passphrase
+//! tells us the TPM2 unlock failed, not *why*; re-enrolling fixes a policy whose
+//! PCRs have drifted and fixes nothing else, so without this a volume failing
+//! for an unrelated reason would have its header rewritten on every boot.
 //!
-//! The comparison is between two digests:
-//!
-//!   * what the header says the policy is -- `tpm2-policy-hash` in the
-//!     `systemd-tpm2` token, put there when the volume was enrolled.
-//!   * what a policy built from the PCRs *as they are right now* would come out
-//!     as.
-//!
-//! The second one is computed by the TPM itself, in a trial session
-//! (`tpm2::Tpm::pcr_policy_digest`). The alternative was to reimplement
-//! `tpm2_calculate_sealing_policy()` in software, which means owning a copy of
-//! systemd's hashing and keeping it correct across systemd releases. Asking the
-//! hardware that will later be asked to unseal is both less code and a better
-//! authority.
+//! The comparison is between the header's `tpm2-policy-hash`, written when the
+//! volume was enrolled, and a policy built from the PCRs as they are right now.
+//! The TPM computes the second itself in a trial session
+//! (`tpm2::Tpm::pcr_policy_digest`) -- asking the hardware that will later be
+//! asked to unseal is less code than reimplementing
+//! `tpm2_calculate_sealing_policy()`, and a better authority.
 
 use crate::token::Tpm2Token;
 use crate::tpm2::{Bank, Tpm};
 
-/// What we were able to conclude.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Drift {
-	/// The current PCRs no longer satisfy the sealed policy. Re-enrolling is
-	/// exactly the repair for this.
+	/// The current PCRs no longer satisfy the sealed policy, which re-enrolling
+	/// is exactly the repair for.
 	Drifted { enrolled: Vec<u8>, current: Vec<u8> },
-	/// The current PCRs still satisfy it, so the unlock failed for some other
-	/// reason and rewriting the header would achieve nothing.
+	/// They still satisfy it, so the unlock failed for some other reason and
+	/// rewriting the header would achieve nothing.
 	Matches,
-	/// We could not work it out. Never treated as drift: guessing here means
-	/// wiping a working enrollment.
+	/// Never treated as drift: guessing here means wiping a working enrollment.
 	Unknown(String),
 }
 
@@ -57,9 +47,8 @@ impl Drift {
 /// Compare `token`'s sealed policy against the machine's present state.
 pub fn check(tpm: &mut Tpm, token: &Tpm2Token) -> Drift {
 	if let Some(kind) = token.advanced {
-		// A signed or pcrlock policy is not a literal-PCR policy, so a PCR
-		// trial session computes a digest that was never meant to match.
-		// Section 6.2 puts these outside this tool's remit anyway.
+		// Not a literal-PCR policy, so a PCR trial session computes a digest
+		// that was never meant to match.
 		return Drift::Unknown(format!("the enrollment uses {kind}"));
 	}
 
@@ -94,8 +83,7 @@ pub fn check(tpm: &mut Tpm, token: &Tpm2Token) -> Drift {
 	}
 }
 
-/// Enough of a digest to tell two apart in a log line, which is all section 6's
-/// audit requirement needs from it.
+/// Enough of a digest to tell two apart in a log line.
 pub fn short(digest: &[u8]) -> String {
 	let mut out = String::with_capacity(16);
 	for b in digest.iter().take(8) {
@@ -124,9 +112,8 @@ mod tests {
 
 	#[test]
 	fn an_empty_pcr_set_cannot_have_drifted() {
-		// Reported without touching the TPM at all, which is what lets this be
-		// a unit test: an enrollment over no PCRs unlocks unconditionally, so
-		// its failure is always something else.
+		// An enrollment over no PCRs unlocks unconditionally, so its failure is
+		// always something else.
 		let mut t = token();
 		t.pcrs = vec![];
 		let actual = check_without_tpm(&t);
@@ -139,9 +126,8 @@ mod tests {
 
 	#[test]
 	fn an_advanced_policy_is_unknown_not_drifted() {
-		// The important half of this: Unknown must not be actionable. Reading a
-		// signed-policy enrollment as drift would wipe a working token that
-		// this tool cannot recreate.
+		// Unknown must not be actionable: reading a signed-policy enrollment as
+		// drift would wipe a working token this tool cannot recreate.
 		let mut t = token();
 		t.advanced = Some("a signed PCR policy");
 		let actual = check_without_tpm(&t);
@@ -162,10 +148,9 @@ mod tests {
 		);
 	}
 
-	/// The part of `check` that runs before the TPM is consulted.
-	///
-	/// `None` means the real function would have gone on to ask the hardware,
-	/// which the VM test covers instead.
+	/// The part of `check` that runs before the TPM is consulted. `None` means
+	/// the real function would have gone on to ask the hardware, which the VM
+	/// test covers instead.
 	fn check_without_tpm(token: &Tpm2Token) -> Option<Drift> {
 		if let Some(kind) = token.advanced {
 			return Some(Drift::Unknown(format!("the enrollment uses {kind}")));

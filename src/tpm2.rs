@@ -1,14 +1,11 @@
 //! Talking to the TPM directly over `/dev/tpmrm0`.
 //!
-//! The alternative was a TSS binding, which means linking tpm2-tss and giving up
-//! the static musl build of DESIGN.md section 9, or shelling out to tpm2-tools
-//! and putting all of it in the initrd. What we actually need is four commands,
-//! none of which takes a session or an authorization, so the wire format is
-//! small enough to write out: a 10-byte header, a handle area, a parameter area.
-//!
-//! The kernel's resource manager device is command/response oriented -- one
-//! `write(2)` is one command, one `read(2)` is its response -- so there is no
-//! framing to get wrong beyond the marshalling itself.
+//! The alternatives were linking tpm2-tss, which gives up the static musl
+//! build, or putting tpm2-tools in the initrd. We need four commands, none of
+//! which takes a session or an authorization, so the wire format is small
+//! enough to write out: a 10-byte header, a handle area, a parameter area. The
+//! resource manager device is command/response oriented -- one `write(2)` is
+//! one command, one `read(2)` is its response.
 //!
 //! References are to the TPM 2.0 Library Specification, Part 2 (Structures) and
 //! Part 3 (Commands).
@@ -40,8 +37,7 @@ const PT_MAX_AUTH_FAIL: u32 = 0x0000_020f;
 /// TPMA_PERMANENT.inLockout, bit 9.
 const PERMANENT_IN_LOCKOUT: u32 = 1 << 9;
 
-/// The largest response we will read. Real responses here are a few hundred
-/// bytes; the TPM's own maximum is 4096.
+/// The TPM's own maximum; real responses here are a few hundred bytes.
 const MAX_RESPONSE: usize = 4096;
 
 /// A PCR bank, i.e. which hash the PCRs were extended with.
@@ -72,7 +68,6 @@ pub struct Lockout {
 	pub max_auth_fail: u32,
 }
 
-/// An open handle on the TPM.
 pub struct Tpm {
 	device: File,
 }
@@ -82,9 +77,8 @@ impl Tpm {
 	/// user at a time, and something else in the initrd may well want it.
 	pub const DEFAULT_DEVICE: &'static str = "/dev/tpmrm0";
 
-	/// `device` is a path, or "auto" for the default -- matching the spelling
-	/// `systemd-cryptenroll --tpm2-device=` accepts, so a config file can say
-	/// the same thing to both.
+	/// `device` is a path, or "auto" for the default, matching what
+	/// `systemd-cryptenroll --tpm2-device=` accepts.
 	pub fn open(device: &str) -> Result<Tpm, String> {
 		let path = if device == "auto" {
 			Self::DEFAULT_DEVICE
@@ -116,10 +110,8 @@ impl Tpm {
 		response_payload(&buf).map_err(|e| format!("command {cc:#010x}: {e}"))
 	}
 
-	/// Read the dictionary-attack state.
-	///
-	/// Also serves as the "is there a responsive TPM here" check of DESIGN.md
-	/// section 4.1: a TPM that answers this answers anything we need.
+	/// Read the dictionary-attack state. Doubles as the "is there a responsive
+	/// TPM here" probe: one that answers this answers anything we need.
 	pub fn lockout(&mut self) -> Result<Lockout, String> {
 		let mut body = Vec::new();
 		put_u32(&mut body, CAP_TPM_PROPERTIES);
@@ -131,7 +123,6 @@ impl Tpm {
 		parse_properties(&payload)
 	}
 
-	/// Read the current value of each PCR in `indices`.
 	pub fn read_pcrs(&mut self, bank: Bank, indices: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, String> {
 		let mut out = Vec::with_capacity(indices.len());
 		let mut remaining: Vec<u8> = indices.to_vec();
@@ -139,8 +130,7 @@ impl Tpm {
 		remaining.dedup();
 
 		// A TPM may return fewer digests than asked for -- eight is a common
-		// limit -- and reports which ones it did return in pcrSelectionOut. So
-		// this loops until the request stops making progress.
+		// limit -- and reports which ones it did in pcrSelectionOut.
 		while !remaining.is_empty() {
 			let mut body = Vec::new();
 			put_pcr_selection(&mut body, bank, &remaining);
@@ -168,11 +158,10 @@ impl Tpm {
 
 	/// Compute the policy digest that the *current* PCR values would produce.
 	///
-	/// This is the whole trick behind the drift check. Rather than recomputing
-	/// systemd's policy in software -- which means reimplementing its hashing
-	/// and tracking it across versions -- we open a **trial** session and have
-	/// the TPM build the policy from the PCRs as they are right now. A trial
-	/// session authorizes nothing; it exists to compute exactly this digest.
+	/// The whole trick behind the drift check. Rather than reimplementing
+	/// systemd's hashing and tracking it across versions, open a trial session
+	/// -- which authorizes nothing and exists to compute exactly this -- and let
+	/// the TPM build the policy from the PCRs as they are right now.
 	///
 	/// `use_pin` mirrors `tpm2_calculate_sealing_policy()`: PolicyPCR, then
 	/// PolicyAuthValue when the enrollment carries a PIN.
@@ -186,8 +175,8 @@ impl Tpm {
 
 		let result = self.build_policy(session, bank, indices, use_pin);
 
-		// The session occupies one of a small number of TPM slots, so it is
-		// released whether or not the policy worked out.
+		// The session occupies one of a small number of TPM slots, so release it
+		// whether or not the policy worked out.
 		if let Err(e) = self.flush(session) {
 			warn_flush(session, &e);
 		}
@@ -205,7 +194,7 @@ impl Tpm {
 		let mut body = Vec::new();
 		put_u32(&mut body, session);
 		// An empty pcrDigest tells the TPM to use the PCRs it currently holds
-		// rather than checking ours against them. That is what makes this a
+		// rather than checking ours against them, which is what makes this a
 		// question about the machine's present state.
 		put_u16(&mut body, 0);
 		put_pcr_selection(&mut body, bank, indices);
@@ -231,9 +220,9 @@ impl Tpm {
 		// Handle area: no salt key, no bind object.
 		put_u32(&mut body, RH_NULL);
 		put_u32(&mut body, RH_NULL);
-		// nonceCaller. The TPM requires at least the session hash's length, and
-		// for a trial session its value carries no weight -- nothing is being
-		// authorized, so there is no replay to prevent.
+		// nonceCaller must be at least the session hash's length. Its value
+		// carries no weight here: nothing is authorized, so there is no replay
+		// to prevent.
 		put_tpm2b(&mut body, &[0u8; 32]);
 		// encryptedSalt: none, since tpmKey is TPM_RH_NULL.
 		put_tpm2b(&mut body, &[]);
@@ -249,9 +238,9 @@ impl Tpm {
 	}
 
 	fn flush(&mut self, handle: u32) -> Result<(), String> {
-		// TPM2_FlushContext is the odd one out: the handle it flushes travels in
-		// the parameter area, not the handle area, so that a handle the TPM no
-		// longer tracks can still be named.
+		// The odd one out: FlushContext's handle travels in the parameter area,
+		// not the handle area, so a handle the TPM no longer tracks can still be
+		// named.
 		let mut body = Vec::new();
 		put_u32(&mut body, handle);
 		self.transact(CC_FLUSH_CONTEXT, &body)?;
@@ -295,8 +284,8 @@ fn response_payload(buf: &[u8]) -> Result<Vec<u8>, String> {
 	Ok(buf[10..].to_vec())
 }
 
-/// Enough of the response-code space to make a log line useful. The full table
-/// is large and most of it cannot occur for unauthenticated commands.
+/// Enough of the response-code space to make a log line useful; most of the
+/// full table cannot occur for unauthenticated commands.
 fn describe_rc(rc: u32) -> String {
 	let known = match rc {
 		0x000_0100 => Some("TPM_RC_INITIALIZE (the TPM has not been started)"),
@@ -409,8 +398,8 @@ fn put_pcr_selection(out: &mut Vec<u8>, bank: Bank, indices: &[u8]) {
 	out.extend_from_slice(&bitmap);
 }
 
-/// A cursor that refuses to read past the end, so a short or malformed response
-/// is an error rather than a panic.
+/// Refuses to read past the end, so a short or malformed response is an error
+/// rather than a panic.
 struct Reader<'a> {
 	buf: &'a [u8],
 	at: usize,
@@ -475,9 +464,8 @@ mod tests {
 
 	#[test]
 	fn selects_the_right_pcr_bits() {
-		// PCR 7 is bit 7 of byte 0; PCR 16 is bit 0 of byte 2. Getting this
-		// backwards would compute a policy over the wrong registers and report
-		// drift on a machine that has not drifted.
+		// Getting the bit order backwards would compute a policy over the wrong
+		// registers and report drift on a machine that has not drifted.
 		let cases: [(&[u8], [u8; 3]); 4] = [
 			(&[0], [0x01, 0x00, 0x00]),
 			(&[7], [0x80, 0x00, 0x00]),
@@ -514,8 +502,8 @@ mod tests {
 
 	#[test]
 	fn rejects_a_failed_response() {
-		// 0x120 is TPM_RC_LOCKOUT. Reading a failure as success would hand back
-		// a garbage digest and call it a policy.
+		// Reading a failure as success would hand back a garbage digest and call
+		// it a policy.
 		let buf = vec![0x80, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x20];
 		let actual = response_payload(&buf);
 		assert!(
@@ -574,8 +562,8 @@ mod tests {
 
 	#[test]
 	fn a_clear_permanent_word_is_not_lockout() {
-		// lockoutAuthSet is bit 2 and must not be mistaken for inLockout at
-		// bit 9, or every machine with a lockout password would be refused.
+		// lockoutAuthSet is bit 2 and must not be mistaken for inLockout at bit
+		// 9, or every machine with a lockout password would be refused.
 		let mut payload = vec![0x00];
 		put_u32(&mut payload, CAP_TPM_PROPERTIES);
 		put_u32(&mut payload, 1);

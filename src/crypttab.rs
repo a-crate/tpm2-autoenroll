@@ -1,41 +1,32 @@
 //! Where the daemon learns which volumes exist, from the same file
 //! systemd-cryptsetup is driven by.
 //!
-//! crypttab(5) already says everything we need: which volumes there are, what
-//! backs each one, and which of them are TPM2-bound. Reading it directly means
-//! there is no second list to keep in sync, and no way to be configured for a
-//! volume systemd is not actually unlocking.
-//!
-//! A line is ours when its options carry `tpm2-device=`. That option is exactly
-//! what makes systemd-cryptsetup attempt a TPM2 unlock, so it is also exactly
-//! the set of volumes that can fall back from one.
+//! Reading crypttab(5) directly means there is no second list to keep in sync,
+//! and no way to be configured for a volume systemd is not actually unlocking.
+//! A line is ours when its options carry `tpm2-device=`, which is exactly what
+//! makes systemd-cryptsetup attempt a TPM2 unlock and so exactly the set of
+//! volumes that can fall back from one.
 //!
 //! Field 3 -- the key file -- gets a warning and nothing more. Setting it leaves
-//! `try_discover_key` false, so systemd-cryptsetup will not go looking for our
-//! socket and the volume will most likely never reach us. Most likely, not
-//! certainly: field 3 may itself name this daemon's socket, and then we are
-//! consulted after all. Either way the volume costs one listening fd, so serving
-//! it and being ignored is cheaper than deciding on the user's behalf that their
-//! crypttab is wrong.
+//! `try_discover_key` false, so the volume will most likely never reach us --
+//! most likely, not certainly, since field 3 may name this daemon's socket.
+//! Serving it and being ignored costs one fd, which is cheaper than deciding on
+//! the user's behalf that their crypttab is wrong.
 
 use crate::log::warning;
 
 pub const DEFAULT_PATH: &str = "/etc/crypttab";
 
-/// The option that marks a volume as TPM2-bound, and carries the device to
-/// enroll against.
 const TPM2_DEVICE: &str = "tpm2-device";
 
 /// A volume we are prepared to manage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Volume {
-	/// The mapper name, i.e. crypttab field 1. Also what the socket we listen
-	/// on is named after and what systemd-cryptsetup puts in its bindname.
+	/// crypttab field 1. Also what our socket is named after and what
+	/// systemd-cryptsetup puts in its bindname.
 	pub name: String,
 	/// The backing block device, resolved to a path.
 	pub device: String,
-	/// `--tpm2-device=` for systemd-cryptenroll, and the device we read PCRs
-	/// and lockout state from.
 	pub tpm2_device: String,
 }
 
@@ -47,8 +38,8 @@ pub fn load(path: &str) -> Result<Vec<Volume>, String> {
 /// Every TPM2-bound volume in a crypttab, in the order it appears.
 ///
 /// A line we cannot use costs that line and nothing else: the file is shared
-/// with systemd, so it may well contain volumes that are none of our business
-/// and options this build has never heard of.
+/// with systemd, so it may hold volumes that are none of our business and
+/// options this build has never heard of.
 pub fn parse(text: &str) -> Vec<Volume> {
 	let mut out = Vec::new();
 	for line in text.lines() {
@@ -66,7 +57,7 @@ pub fn parse(text: &str) -> Vec<Volume> {
 	out
 }
 
-/// A volume we will serve, and anything about its entry that is likely to stop
+/// A volume we will serve, plus anything about its entry that is likely to stop
 /// it ever reaching us.
 struct Managed {
 	volume: Volume,
@@ -114,7 +105,6 @@ fn entry(line: &str) -> Result<Option<Managed>, String> {
 	}))
 }
 
-/// The value of `name=` in a comma-separated crypttab option list.
 fn option<'a>(options: &'a str, name: &str) -> Option<&'a str> {
 	options.split(',').find_map(|o| {
 		let (key, value) = o.split_once('=')?;
@@ -122,10 +112,9 @@ fn option<'a>(options: &'a str, name: &str) -> Option<&'a str> {
 	})
 }
 
-/// Turn an fstab-style device spec into a path.
-///
-/// systemd resolves these itself; we need the path because the passphrase is
-/// validated against the header and systemd-cryptenroll is pointed at it.
+/// Turn an fstab-style device spec into a path. systemd resolves these itself;
+/// we need the path because the passphrase is validated against the header and
+/// systemd-cryptenroll is pointed at it.
 pub fn resolve(spec: &str) -> String {
 	let tags = [
 		("UUID=", "by-uuid"),
@@ -194,8 +183,7 @@ swap /dev/vdc - tpm2-device=/dev/tpmrm0,noauto
 	#[test]
 	fn a_key_file_is_a_warning_rather_than_a_disqualification() {
 		// Field 3 usually means we are never consulted, but the socket is cheap
-		// and the path may even be ours. Which crypttab a machine wants is the
-		// user's business.
+		// and the path may even be ours.
 		let input = "root /dev/vda2 /etc/keys/root.key tpm2-device=auto";
 		let expected = vec![volume("root", "/dev/vda2", "auto")];
 		let actual = parse(input);
@@ -231,8 +219,7 @@ swap /dev/vdc - tpm2-device=/dev/tpmrm0,noauto
 
 	#[test]
 	fn a_missing_option_field_is_not_an_error() {
-		// Three-field and two-field entries are both legal crypttab; neither is
-		// TPM2-bound, so neither is ours.
+		// Three-field and two-field entries are both legal crypttab.
 		let input = "root /dev/vda2 -\nswap /dev/vdc\n";
 		let actual = parse(input);
 		assert!(

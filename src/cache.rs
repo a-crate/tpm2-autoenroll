@@ -1,22 +1,17 @@
 //! The passphrases this boot has already seen.
 //!
-//! DESIGN.md section 5: every managed volume opens its own connection to us, so
-//! a machine with five volumes sharing one passphrase would produce five prompts
-//! unless we remember. Discovery runs before systemd's own keyring lookup
-//! (cryptsetup.c:2742 is reachable only once discovery has produced nothing), so
-//! for a managed volume the keyring cannot answer on our behalf -- this cache is
-//! what keeps the user typing once.
-//!
-//! Scope is the daemon's lifetime, which in the initrd is the initrd. It is not
-//! a mirror of the kernel keyring; that interop lives in `askpw`, which pushes
-//! what it collects and accepts what is already there.
+//! Every managed volume opens its own connection, so five volumes sharing one
+//! passphrase would produce five prompts unless we remember. Discovery runs
+//! before systemd's own keyring lookup (cryptsetup.c:2742 is reachable only once
+//! discovery has produced nothing), so for a managed volume the keyring cannot
+//! answer on our behalf. Scope is the daemon's lifetime, which in the initrd is
+//! the initrd; keyring interop lives in `askpw` instead.
 
 use crate::secret::Secret;
 
-/// Insertion-ordered and deduplicated.
-///
-/// Order matters a little: the passphrase that unlocked the previous volume is
-/// the one most likely to unlock the next, and every miss costs a KDF pass.
+/// Insertion-ordered and deduplicated. Order matters a little: the passphrase
+/// that unlocked the previous volume is the one most likely to unlock the next,
+/// and every miss costs a KDF pass.
 #[derive(Default)]
 pub struct Cache {
 	entries: Vec<Secret>,
@@ -27,8 +22,6 @@ impl Cache {
 		Cache::default()
 	}
 
-	/// Remember a passphrase that has been validated against some volume.
-	///
 	/// Only validated secrets belong here. A wrong one would be tried against
 	/// every later volume, costing a KDF pass each time and teaching us nothing.
 	pub fn insert(&mut self, secret: Secret) {
@@ -74,8 +67,8 @@ mod tests {
 
 	#[test]
 	fn ignores_a_repeat() {
-		// Two volumes sharing a passphrase must not leave two copies behind,
-		// or the third volume pays two KDF passes to learn one thing.
+		// Two copies would make the third volume pay two KDF passes to learn one
+		// thing.
 		let mut cache = Cache::new();
 		cache.insert(Secret::new(b"shared".to_vec()));
 		cache.insert(Secret::new(b"shared".to_vec()));

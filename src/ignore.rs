@@ -1,13 +1,12 @@
 //! The opt-out list: volumes that are TPM2-bound but must never be re-enrolled.
 //!
 //! There is no positive configuration to balance this against -- the crypttab
-//! decides what exists -- so the only thing a user can say is "not that one".
-//! Written as one entry per line rather than as structured configuration
-//! because that is the entire vocabulary.
+//! decides what exists -- so "not that one" is the entire vocabulary, hence one
+//! entry per line rather than structured configuration.
 //!
 //! An entry matches either the volume (mapper) name or the backing device, and
-//! device specs are resolved the same way crypttab's are, so `UUID=...` in this
-//! file means what it means there.
+//! device specs resolve the way crypttab's do, so `UUID=...` in this file means
+//! what it means there.
 
 use std::collections::BTreeSet;
 
@@ -20,11 +19,9 @@ pub struct Ignore {
 	entries: BTreeSet<String>,
 }
 
-/// Read the ignore list.
-///
-/// A missing file is an empty list rather than an error: not having opted any
-/// volume out is the ordinary case, and the module only writes the file when it
-/// has something to put in it.
+/// A missing file is an empty list rather than an error: opting nothing out is
+/// the ordinary case, and the NixOS module only writes the file when it has
+/// something to put in it.
 pub fn load(path: &str) -> Result<Ignore, String> {
 	match std::fs::read_to_string(path) {
 		Ok(text) => Ok(parse(&text)),
@@ -84,8 +81,8 @@ mod tests {
 
 	#[test]
 	fn resolves_device_specs_like_crypttab_does() {
-		// The user copies the spec out of their crypttab; it has to mean the
-		// same thing in both files.
+		// The user copies the spec out of their crypttab; it has to mean the same
+		// thing in both files.
 		let list = parse("UUID=abc\n");
 		let input = volume("data", "/dev/disk/by-uuid/abc");
 		let actual = list.covers(&input);
