@@ -113,5 +113,6 @@ The use of AI or LLMs to wholly or partially write the following things is forbi
 * Direct communication with humans.
   This includes pull request titles, description, and comments.
 * Documentation files in this repository. This includes markdown documentation, but does _not_ include code comments.
+  Documentation intended to be read solely by AI (such as CLAUDE.md or AGENTS.md) may be AI authored.
 
 All other usage of AI is welcome and permitted.
