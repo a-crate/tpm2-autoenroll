@@ -9,13 +9,22 @@
 //! makes every failure here recoverable.
 
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
+use crate::child;
 use crate::memfd::SecretFile;
 use crate::secret::Secret;
 use crate::token::Tpm2Token;
 use crate::tpm2::Bank;
 
 const BINARY: &str = "systemd-cryptenroll";
+
+/// A KDF pass to unlock, another to add the new slot, and sealing, which on a
+/// slow TPM takes seconds of its own.
+const ENROLL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One unseal and one KDF pass.
+const UNSEAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Re-bind `device` to the PCR state it is in right now. `pcrs` and `bank` come
 /// from the config.
@@ -56,9 +65,7 @@ pub fn run(
 		.stderr(Stdio::piped());
 	key.attach(&mut cmd);
 
-	let out = cmd
-		.output()
-		.map_err(|e| format!("could not run {BINARY}: {e}"))?;
+	let out = child::run(&mut cmd, ENROLL_TIMEOUT)?;
 
 	if !out.status.success() {
 		let stderr = String::from_utf8_lossy(&out.stderr);
@@ -90,8 +97,8 @@ fn pcr_spec(pcrs: &[u8], bank: &str) -> String {
 /// `libcryptsetup-token-systemd-tpm2.so` this route is unavailable and the
 /// caller falls back to comparing policy digests.
 pub fn test_unseal(device: &str, token_index: u32) -> Result<(), String> {
-	let out = Command::new("cryptsetup")
-		.arg("open")
+	let mut cmd = Command::new("cryptsetup");
+	cmd.arg("open")
 		.arg("--test-passphrase")
 		.arg("--batch-mode")
 		.arg("--token-only")
@@ -100,9 +107,8 @@ pub fn test_unseal(device: &str, token_index: u32) -> Result<(), String> {
 		.arg(device)
 		.stdin(Stdio::null())
 		.stdout(Stdio::null())
-		.stderr(Stdio::piped())
-		.output()
-		.map_err(|e| format!("could not run cryptsetup: {e}"))?;
+		.stderr(Stdio::piped());
+	let out = child::run(&mut cmd, UNSEAL_TIMEOUT)?;
 
 	if out.status.success() {
 		return Ok(());

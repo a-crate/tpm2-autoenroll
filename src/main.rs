@@ -28,6 +28,7 @@
 mod askpw;
 mod bindname;
 mod cache;
+mod child;
 mod config;
 mod consent;
 mod dm;

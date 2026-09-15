@@ -11,10 +11,16 @@
 //! live, so both appear here.
 
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::child;
+
 const BINARY: &str = "cryptsetup";
+
+/// Reading the header involves no KDF, so this is generous.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A `systemd-tpm2` token as it sits in the header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,15 +62,14 @@ const KNOWN_KEYS: &[&str] = &[
 
 /// Every `systemd-tpm2` token in `device`'s header, in header order.
 pub fn read(device: &str) -> Result<Vec<Tpm2Token>, String> {
-	let out = Command::new(BINARY)
-		.arg("luksDump")
+	let mut cmd = Command::new(BINARY);
+	cmd.arg("luksDump")
 		.arg("--dump-json-metadata")
 		.arg(device)
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.output()
-		.map_err(|e| format!("could not run {BINARY}: {e}"))?;
+		.stderr(Stdio::piped());
+	let out = child::run(&mut cmd, TIMEOUT)?;
 
 	if !out.status.success() {
 		let stderr = String::from_utf8_lossy(&out.stderr);

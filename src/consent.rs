@@ -18,6 +18,8 @@
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 
+use crate::askpw;
+use crate::child;
 use crate::tpm2::Bank;
 
 const BINARY: &str = "systemd-ask-password";
@@ -74,21 +76,21 @@ pub fn ask(volume: &str, device: &str, pcrs: &[u8], bank: Bank) -> Answer {
 		bank.name()
 	);
 
-	let out = Command::new(BINARY)
-		.arg("--icon=drive-harddisk")
+	let mut cmd = Command::new(BINARY);
+	cmd.arg("--icon=drive-harddisk")
 		.arg("--emoji=yes")
 		// Distinct from the passphrase prompt's id for the same disk, so an agent
 		// cannot mistake one question for a repeat of the other.
 		.arg(format!("--id=tpm2-autoenroll:{device}"))
 		.arg("--echo=yes")
+		.arg(format!("--timeout={}", askpw::PROMPT_TIMEOUT.as_secs()))
 		.arg("-n")
 		.arg(&message)
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
-		.stderr(Stdio::inherit())
-		.output();
+		.stderr(Stdio::inherit());
 
-	let out = match out {
+	let out = match child::run(&mut cmd, askpw::PROMPT_TIMEOUT + askpw::PROMPT_GRACE) {
 		Ok(o) if o.status.success() => o,
 		Ok(o) => {
 			crate::log::notice!(
@@ -99,7 +101,7 @@ pub fn ask(volume: &str, device: &str, pcrs: &[u8], bank: Bank) -> Answer {
 		}
 		Err(e) => {
 			crate::log::error!(
-				"volume {volume:?}: could not run {BINARY} for consent ({e}); treating that as a refusal"
+				"volume {volume:?}: the consent prompt failed ({e}); treating that as a refusal"
 			);
 			return Answer::No;
 		}

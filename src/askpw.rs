@@ -12,10 +12,21 @@
 //! unrelated volume unlocked earlier in the same boot.
 
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
+use crate::child;
 use crate::secret::Secret;
 
 const BINARY: &str = "systemd-ask-password";
+
+/// `--timeout=` for this prompt and the consent prompt, pinned rather than
+/// left to systemd-ask-password's default. Handling is serial, so this also
+/// bounds how long other volumes wait behind an unanswered prompt.
+pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Allowed on top of `PROMPT_TIMEOUT` before the process is killed, for an
+/// agent that wedges rather than timing out.
+pub const PROMPT_GRACE: Duration = Duration::from_secs(30);
 
 /// How many candidates from one prompt we are willing to try.
 ///
@@ -50,6 +61,7 @@ pub fn ask(volume: &str, device: &str, attempt: Attempt) -> Result<Vec<Secret>, 
 		// one belongs to another volume it masks the entry that would have
 		// worked.
 		.arg("--multiple")
+		.arg(format!("--timeout={}", PROMPT_TIMEOUT.as_secs()))
 		.arg("-n");
 
 	if attempt == Attempt::First {
@@ -64,9 +76,7 @@ pub fn ask(volume: &str, device: &str, attempt: Attempt) -> Result<Vec<Secret>, 
 	.stdout(Stdio::piped())
 	.stderr(Stdio::inherit());
 
-	let out = cmd
-		.output()
-		.map_err(|e| format!("could not run {BINARY}: {e}"))?;
+	let out = child::run(&mut cmd, PROMPT_TIMEOUT + PROMPT_GRACE)?;
 
 	// A timeout is reported this way too, and declining on it is right: the
 	// prompt reverts to systemd-cryptsetup, which applies its own timeout.

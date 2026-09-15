@@ -10,11 +10,17 @@
 //! would forfeit the static musl build. The cost is one full KDF pass per check.
 
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
+use crate::child;
 use crate::memfd::SecretFile;
 use crate::secret::Secret;
 
 const BINARY: &str = "cryptsetup";
+
+/// One KDF pass. argon2id tuned on a fast machine can take several seconds on
+/// a slow one; a minute means the device is the problem.
+const TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -52,9 +58,9 @@ pub fn test_passphrase(device: &str, secret: &Secret) -> Verdict {
 		.stderr(Stdio::piped());
 	key.attach(&mut cmd);
 
-	let out = match cmd.output() {
+	let out = match child::run(&mut cmd, TIMEOUT) {
 		Ok(o) => o,
-		Err(e) => return Verdict::Unusable(format!("could not run {BINARY}: {e}")),
+		Err(e) => return Verdict::Unusable(e),
 	};
 
 	match verdict_from_code(out.status.code()) {
