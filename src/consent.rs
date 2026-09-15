@@ -9,6 +9,11 @@
 //! Unlike the passphrase prompt in `askpw` this passes `--echo=yes`, since the
 //! answer is not a secret, and no `--keyname=`, since pushing "y" into the
 //! `cryptsetup` keyring would leave it there as a candidate passphrase.
+//!
+//! systemd-ask-password accepts a reply from any uid-0 sender on its socket, so
+//! a root process watching `/run/systemd/ask-password` could answer this
+//! question too. The daemon exiting once its volumes are served is what keeps
+//! that window short.
 
 use std::collections::HashSet;
 use std::process::{Command, Stdio};

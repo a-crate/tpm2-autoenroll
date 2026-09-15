@@ -24,6 +24,8 @@
 #   7. Once every configured volume has been served the daemon exits, taking
 #      its sockets and its passphrase cache with it, and the next unlock
 #      starts it again.
+#   8. A root process outside the volume's systemd-cryptsetup@ unit gets
+#      nothing, even when it binds the plain-phase name.
 #
 # PCR 16 is the debug PCR: extendable from userspace, which lets us manufacture
 # the policy mismatch in place. No reboot and no boot loader, so the test is
@@ -811,6 +813,37 @@ pkgs.testers.runNixOSTest {
             f"cryptsetup luksDump {DEVICE3} digest was {before} before and "
             f"{after} after, expected them to be equal: a tampered header must "
             "be left exactly as the attacker wrote it"
+        )
+
+    with subtest("a peer outside the volume's unit gets nothing, whatever name it binds"):
+        # The daemon is up with the passphrase cached: the subtests above were
+        # answered from it. The test shell is root but lives in
+        # backdoor.service, so binding systemd-cryptsetup's plain-phase name
+        # must not be enough to be handed that passphrase.
+        spoof = """import socket, sys
+    name = sys.argv[1]
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind("\\0deadbeef/cryptsetup/" + name)
+    s.connect("/run/cryptsetup-keys.d/" + name + ".key")
+    print(len(s.recv(4096)))
+    """.replace("\n    ", "\n")
+        machine.succeed(f"cat > /tmp/spoof.py <<'EOF'\n{spoof}EOF")
+        watch = LogWatch()
+
+        out = machine.succeed(f"${pkgs.python3}/bin/python3 /tmp/spoof.py {VOLUME3}").strip()
+        assert out == "0", (
+            f"spoof.py {VOLUME3} read {out} bytes, expected 0: a peer outside "
+            "the volume's unit must be declined"
+        )
+        log = watch.new()
+        expected = f"is not in systemd-cryptsetup@{VOLUME3}.service; declining"
+        assert expected in log, (
+            f"the spoofed connection produced:\n{log}\n"
+            f"expected a {expected!r} line"
+        )
+        assert "returned" not in log, (
+            f"the spoofed connection produced:\n{log}\n"
+            "expected no 'returned' line: nothing may be written to it"
         )
 
     with subtest("every volume was paired with the device the config names"):

@@ -37,6 +37,7 @@ mod log;
 mod luks;
 mod memfd;
 mod notify;
+mod peer;
 mod preflight;
 mod secret;
 mod sockets;
@@ -405,7 +406,13 @@ fn handle(
 	}
 
 	match peer_name.phase {
+		// Only the plain phase is ever answered with anything, so only it needs
+		// to know who is asking. A failed check does not count as served.
 		Phase::Plain => {
+			if let Err(why) = peer::check(&conn, volume) {
+				warning!("volume {volume:?}: {why}; declining");
+				return false;
+			}
 			serve_passphrase(conn, managed, cache, decided);
 			true
 		}

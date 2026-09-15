@@ -37,7 +37,7 @@ The binary is `tpm2-autoenrolld`, a single-threaded daemon. It hooks into system
 
 On each connection, the peer's abstract AF_UNIX bind name (`bindname.rs`) shows which phase of systemd-cryptsetup's unlock loop is asking:
 - **TPM2/FIDO2/PKCS#11 phase**: close with zero bytes. systemd then falls through to the LUKS2 header token and a normal TPM2 unlock goes ahead untouched.
-- **Plain phase** (every token has failed): `main::serve_passphrase` does the following, all before replying:
+- **Plain phase** (every token has failed): first `peer.rs` checks the connecting process is uid 0 and inside `systemd-cryptsetup@<volume>.service` (by cgroup, pinned with `SO_PEERPIDFD`), since any process can bind any name. Then `main::serve_passphrase` does the following, all before replying:
   1. `acquire`: tries passphrases cached earlier this boot (`cache.rs`), then prompts via `systemd-ask-password` (`askpw.rs`). Every candidate is checked against the device with `cryptsetup` (`luks.rs`) before it is trusted.
   2. `maybe_reenroll`: opens the TPM (`tpm2.rs`, raw TPM2 wire protocol over `/dev/tpmrm0`), reads the `systemd-tpm2` token from the header (`token.rs`), then runs the `preflight.rs` checks, one of which refuses when the header's PCR selection or bank differs from the config. The last of those is `drift.rs`, which compares the header's policy hash with a trial-session digest of the current PCRs. Next it asks for consent (`consent.rs`: Yes/Always/No, remembered per PCR state for this daemon's lifetime only), then runs `systemd-cryptenroll --wipe-slot=tpm2` (`enroll.rs`), and finally verifies the result with a token-only unseal, falling back to a drift comparison.
   3. `reply`: writes the passphrase verbatim.

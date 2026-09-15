@@ -68,8 +68,9 @@ pub fn parse(name: &[u8]) -> Option<PeerName<'_>> {
 	let slash = name.iter().position(|&b| b == b'/')?;
 	let (random, rest) = name.split_at(slash);
 
-	// crypttab(5) promises alphanumeric. Enforcing it means a name that did not
-	// come from systemd-cryptsetup is rejected rather than coerced into a phase.
+	// crypttab(5) promises alphanumeric. Enforcing it keeps a malformed name
+	// from being coerced into a phase. It proves nothing about who bound the
+	// name -- any process can -- which is `peer::check`'s job.
 	if random.is_empty() || !random.iter().all(u8::is_ascii_alphanumeric) {
 		return None;
 	}
