@@ -90,6 +90,35 @@ let
       NotifyAccess = "main";
       ExecStart = "${lib.getExe cfg.package} --config=${configPath}";
       LimitCORE = "0";
+
+      # Sandboxing that takes nothing the daemon uses. It needs block devices,
+      # the TPM and its sockets in /run, so nothing here restricts devices or
+      # /run: not PrivateDevices or DevicePolicy, and not ProtectClock either,
+      # which implies a DeviceAllow= list and so closes off every other device.
+      NoNewPrivileges = true;
+      LockPersonality = true;
+      SystemCallArchitectures = "native";
+      RestrictRealtime = true;
+      RestrictSUIDSGID = true;
+      UMask = "0077";
+      # libcryptsetup can decrypt keyslots through AF_ALG and talks to udev and
+      # device-mapper over netlink; everything else is AF_UNIX.
+      RestrictAddressFamilies = [
+        "AF_UNIX"
+        "AF_ALG"
+        "AF_NETLINK"
+      ];
+    }
+    # Stage 2 only. No test boots the initrd, and these all rest on mount
+    # namespacing there that nothing has exercised. PrivateTmp adds no mount
+    # dependencies here: with DefaultDependencies=no it becomes "disconnected".
+    // lib.optionalAttrs (!initrd) {
+      ProtectHome = true;
+      PrivateTmp = true;
+      ProtectKernelModules = true;
+      ProtectKernelLogs = true;
+      ProtectHostname = true;
+      RestrictNamespaces = true;
     };
   };
 

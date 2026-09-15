@@ -70,6 +70,8 @@ Volumes are listed in `services.tpm2-autoenroll.volumes.<name> = { device; tpm2D
 - a drop-in on the `systemd-cryptsetup@.service` template adding `Wants=`/`After=` on the daemon;
 - a config at `/etc/tpm2-autoenroll/config.json` holding only that stage's volumes (`boot.initrd.systemd.contents` or `environment.etc`).
 
+The service is sandboxed (`NoNewPrivileges`, `RestrictAddressFamilies=AF_UNIX AF_ALG AF_NETLINK`, and more in stage 2 only, since no test boots the initrd). It needs block devices and the TPM, so never add `PrivateDevices`, `DevicePolicy` or `ProtectClock` (which implies a `DeviceAllow=` list). The VM coverage for these directives is `moduletest.nix`; `vmtest.nix` uses a hand-written unit.
+
 `Wants=` is used rather than `Requires=` so that a daemon which fails to start costs the feature, not the boot. Initrd volumes assert that `boot.initrd.systemd.enable` and `boot.initrd.systemd.tpm2.enable` are set, and that `boot.initrd.luks.devices.<name>` exists, has no `keyFile`, and has `tpm2-device=` in `crypttabExtraOpts`.
 
 ## Conventions
