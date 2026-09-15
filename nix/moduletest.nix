@@ -21,9 +21,13 @@
 #   4. The generated wiring actually carries a repair end to end, so a passing
 #      module test is not merely a passing unit-file diff.
 #
-# stage = "system" puts the units in stage 2 where the test can drive them; the
+# stages.system puts the units in stage 2 where the test can drive them; the
 # initrd path differs only in where the same unit, drop-in and config are
 # written.
+#
+# The volumes attrset below is also the expected config's volumes object with
+# the two defaulted keys filled in, which is the point of the option names
+# being the wire names.
 {
   pkgs,
   tpm2-autoenroll-module,
@@ -37,16 +41,14 @@ let
     modtest = {
       device = "/dev/vdb";
       pcrs = [ 16 ];
-      stage = "system";
     };
     # Names its TPM by path and its bank explicitly, so the config shows both
     # passing through the module.
     modtest2 = {
       device = "/dev/vdc";
-      tpm2Device = "/dev/tpmrm0";
+      tpm2_device = "/dev/tpmrm0";
       pcrs = [ 16 ];
-      pcrBank = "sha256";
-      stage = "system";
+      pcr_bank = "sha256";
     };
   };
 
@@ -105,7 +107,7 @@ pkgs.testers.runNixOSTest {
       services.tpm2-autoenroll = {
         enable = true;
         package = tpm2-autoenrolld;
-        inherit volumes;
+        stages.system = { inherit volumes; };
       };
     };
 

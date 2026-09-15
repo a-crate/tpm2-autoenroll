@@ -65,7 +65,7 @@ The binary is meant to go into the initrd, so closure size shapes the code:
 
 ### NixOS module (`nix/module.nix`)
 
-Volumes are listed in `services.tpm2-autoenroll.volumes.<name> = { device; tpm2Device ? "auto"; pcrs; pcrBank ? "sha256"; stage ? "initrd"; }` (`stage` is `initrd` or `system`). The Nix options are camelCase, the JSON keys snake_case. For each stage that has volumes it installs:
+Volumes are listed per stage in `services.tpm2-autoenroll.stages.<initrd|system>.volumes.<name> = { device; pcrs; tpm2_device ? "auto"; pcr_bank ? "sha256"; }`. The options are named after the JSON keys and the volume submodule is freeform (`pkgs.formats.json`), so a stage's `volumes` attrset is written out as the config's `volumes` object verbatim and an undeclared key reaches the daemon untouched — where an unrecognised one rejects that volume, costing it the feature at boot rather than failing the build. For each stage that has volumes it installs:
 - a `Type=notify`, `DefaultDependencies=no` service ordered before `cryptsetup-pre.target`, which in the initrd also conflicts with `initrd-switch-root.target`;
 - a drop-in on the `systemd-cryptsetup@.service` template adding `Wants=`/`After=` on the daemon;
 - a config at `/etc/tpm2-autoenroll/config.json` holding only that stage's volumes (`boot.initrd.systemd.contents` or `environment.etc`).
