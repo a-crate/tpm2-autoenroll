@@ -47,10 +47,14 @@ impl Drift {
 /// The selection comes from the config rather than the token: the token is
 /// only trusted for the digest it is compared against.
 pub fn check(tpm: &mut Tpm, token: &Tpm2Token, pcrs: &[u8], bank: Bank) -> Drift {
-	if let Some(kind) = token.advanced {
-		// Not a literal-PCR policy, so a PCR trial session computes a digest
-		// that was never meant to match.
+	// Not a literal-PCR policy, so a PCR trial session computes a digest that
+	// was never meant to match. The preflight refuses both before getting
+	// here; this keeps the function honest on its own.
+	if let Some(kind) = &token.advanced {
 		return Drift::Unknown(format!("the enrollment uses {kind}"));
+	}
+	if token.pin {
+		return Drift::Unknown("the enrollment requires a TPM2 PIN".to_string());
 	}
 
 	if pcrs.is_empty() {
@@ -59,7 +63,7 @@ pub fn check(tpm: &mut Tpm, token: &Tpm2Token, pcrs: &[u8], bank: Bank) -> Drift
 		return Drift::Matches;
 	}
 
-	let current = match tpm.pcr_policy_digest(bank, pcrs, token.pin) {
+	let current = match tpm.pcr_policy_digest(bank, pcrs) {
 		Ok(d) => d,
 		Err(e) => return Drift::Unknown(e),
 	};
@@ -118,7 +122,7 @@ mod tests {
 		// Unknown must not be actionable: reading a signed-policy enrollment as
 		// drift would wipe a working token this tool cannot recreate.
 		let mut t = token();
-		t.advanced = Some("a signed PCR policy");
+		t.advanced = Some("a signed PCR policy".to_string());
 		let actual = check_without_tpm(&t, &[7]);
 		assert!(
 			matches!(actual, Some(Drift::Unknown(_))),
@@ -126,12 +130,30 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn a_pin_policy_is_unknown_not_drifted() {
+		// The trial session no longer builds PolicyAuthValue, so its digest
+		// could never match a PIN enrollment.
+		let mut t = token();
+		t.pin = true;
+		let actual = check_without_tpm(&t, &[7]);
+		assert!(
+			matches!(actual, Some(Drift::Unknown(_))),
+			"check(<PIN token>, pcrs = [7]) returned {actual:?}, expected Some(Unknown(_))"
+		);
+	}
+
 	/// The part of `check` that runs before the TPM is consulted. `None` means
 	/// the real function would have gone on to ask the hardware, which the VM
 	/// test covers instead.
 	fn check_without_tpm(token: &Tpm2Token, pcrs: &[u8]) -> Option<Drift> {
-		if let Some(kind) = token.advanced {
+		if let Some(kind) = &token.advanced {
 			return Some(Drift::Unknown(format!("the enrollment uses {kind}")));
+		}
+		if token.pin {
+			return Some(Drift::Unknown(
+				"the enrollment requires a TPM2 PIN".to_string(),
+			));
 		}
 		if pcrs.is_empty() {
 			return Some(Drift::Matches);

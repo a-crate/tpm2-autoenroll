@@ -28,10 +28,31 @@ pub struct Tpm2Token {
 	/// What a drift check compares against.
 	pub policy_hash: Vec<u8>,
 	pub pin: bool,
-	/// A signed-PCR-policy or pcrlock enrollment. We can neither judge nor
+	/// Why the policy is more than a literal PCR policy: signed, pcrlock, or
+	/// carrying a field this build does not know. We can neither judge nor
 	/// reproduce these, and must not wipe them.
-	pub advanced: Option<&'static str>,
+	pub advanced: Option<String>,
 }
+
+/// Every key `tpm2_make_luks2_json()` writes as of systemd 261.2. Anything else
+/// is a policy element from a newer systemd, which would otherwise read as
+/// drift and be silently dropped by a repair.
+const KNOWN_KEYS: &[&str] = &[
+	"type",
+	"keyslots",
+	"tpm2-blob",
+	"tpm2-pcrs",
+	"tpm2-pcr-bank",
+	"tpm2-primary-alg",
+	"tpm2-policy-hash",
+	"tpm2-pin",
+	"tpm2_pcrlock",
+	"tpm2_pubkey_pcrs",
+	"tpm2_pubkey",
+	"tpm2_salt",
+	"tpm2_srk",
+	"tpm2_pcrlock_nv",
+];
 
 /// Every `systemd-tpm2` token in `device`'s header, in header order.
 pub fn read(device: &str) -> Result<Vec<Tpm2Token>, String> {
@@ -96,24 +117,13 @@ fn token(index: u32, value: &Value) -> Result<Tpm2Token, String> {
 		None => return Err(format!("token {index} has no \"tpm2-policy-hash\"")),
 	};
 
-	// systemd writes these only when true.
+	// systemd writes tpm2-pin only when true, and a salt only exists alongside
+	// a PIN, so either one is enough.
 	let pin = value
 		.get("tpm2-pin")
 		.and_then(Value::as_bool)
-		.unwrap_or(false);
-
-	// Both of these change how the policy is built, in ways a PCR trial session
-	// cannot reproduce: a signed policy authorizes over a public key, and
-	// pcrlock authorizes against an NV index. Recognising them is how we avoid
-	// mistaking "we cannot compute this" for "the PCRs drifted".
-	let advanced = if value.get("tpm2_pubkey").is_some() || value.get("tpm2_pubkey_pcrs").is_some()
-	{
-		Some("a signed PCR policy")
-	} else if value.get("tpm2_pcrlock").and_then(Value::as_bool) == Some(true) {
-		Some("a pcrlock policy")
-	} else {
-		None
-	};
+		.unwrap_or(false)
+		|| value.get("tpm2_salt").is_some();
 
 	Ok(Tpm2Token {
 		index,
@@ -121,8 +131,26 @@ fn token(index: u32, value: &Value) -> Result<Tpm2Token, String> {
 		bank,
 		policy_hash,
 		pin,
-		advanced,
+		advanced: advanced(value),
 	})
+}
+
+/// Signed and pcrlock policies change how the policy is built in ways a PCR
+/// trial session cannot reproduce: one authorizes over a public key, the other
+/// against an NV index. Recognising them, and anything unrecognised, is how we
+/// avoid mistaking "we cannot compute this" for "the PCRs drifted".
+fn advanced(value: &Value) -> Option<String> {
+	let obj = value.as_object()?;
+	if let Some(key) = obj.keys().find(|k| !KNOWN_KEYS.contains(&k.as_str())) {
+		return Some(format!("a field this build does not recognise ({key:?})"));
+	}
+	if obj.contains_key("tpm2_pubkey") || obj.contains_key("tpm2_pubkey_pcrs") {
+		return Some("a signed PCR policy".to_string());
+	}
+	if obj.contains_key("tpm2_pcrlock") || obj.contains_key("tpm2_pcrlock_nv") {
+		return Some("a pcrlock policy".to_string());
+	}
+	None
 }
 
 fn pcr_list(value: &Value) -> Result<Vec<u8>, String> {
@@ -271,6 +299,7 @@ mod tests {
 			r#""tpm2-primary-alg": "ecc", "tpm2_pubkey": "Zm9v", "tpm2_pubkey_pcrs": [11]"#,
 		);
 		let actual = only(&json).advanced;
+		let actual = actual.as_deref();
 		assert_eq!(
 			actual,
 			Some("a signed PCR policy"),
@@ -285,10 +314,68 @@ mod tests {
 			r#""tpm2-primary-alg": "ecc", "tpm2_pcrlock": true"#,
 		);
 		let actual = only(&json).advanced;
+		let actual = actual.as_deref();
 		assert_eq!(
 			actual,
 			Some("a pcrlock policy"),
 			"parse(<token with tpm2_pcrlock>) returned advanced {actual:?}, expected Some(\"a pcrlock policy\")"
+		);
+	}
+
+	#[test]
+	fn a_salt_implies_a_pin() {
+		// systemd only writes tpm2_salt for a PIN enrollment, so a header that
+		// has lost tpm2-pin but kept the salt still needs one.
+		let json = ENROLLED.replace(
+			r#""tpm2-primary-alg": "ecc""#,
+			r#""tpm2-primary-alg": "ecc", "tpm2_salt": "Zm9v""#,
+		);
+		let actual = only(&json).pin;
+		assert!(
+			actual,
+			"parse(<token with tpm2_salt>) returned pin {actual}, expected true"
+		);
+	}
+
+	#[test]
+	fn notices_a_pcrlock_nv_index() {
+		let json = ENROLLED.replace(
+			r#""tpm2-primary-alg": "ecc""#,
+			r#""tpm2-primary-alg": "ecc", "tpm2_pcrlock_nv": "Zm9v""#,
+		);
+		let actual = only(&json).advanced;
+		assert_eq!(
+			actual.as_deref(),
+			Some("a pcrlock policy"),
+			"parse(<token with tpm2_pcrlock_nv>) returned advanced {actual:?}, expected Some(\"a pcrlock policy\")"
+		);
+	}
+
+	#[test]
+	fn an_unrecognised_field_is_advanced() {
+		// A policy element from a newer systemd would otherwise read as drift
+		// and be dropped by the repair.
+		let json = ENROLLED.replace(
+			r#""tpm2-primary-alg": "ecc""#,
+			r#""tpm2-primary-alg": "ecc", "tpm2_future_policy": "x""#,
+		);
+		let actual = only(&json).advanced;
+		assert!(
+			actual.as_deref().is_some_and(|a| a.contains("tpm2_future_policy")),
+			"parse(<token with tpm2_future_policy>) returned advanced {actual:?}, expected Some naming the field"
+		);
+	}
+
+	#[test]
+	fn every_field_systemd_writes_for_a_plain_policy_is_ordinary() {
+		let json = ENROLLED.replace(
+			r#""tpm2-primary-alg": "ecc""#,
+			r#""tpm2-primary-alg": "ecc", "tpm2_srk": "Zm9v""#,
+		);
+		let actual = only(&json).advanced;
+		assert_eq!(
+			actual, None,
+			"parse(<token with tpm2_srk>) returned advanced {actual:?}, expected None"
 		);
 	}
 

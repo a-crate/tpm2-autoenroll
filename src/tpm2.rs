@@ -17,7 +17,6 @@ use std::io::{Read, Write};
 const ST_NO_SESSIONS: u16 = 0x8001;
 
 const CC_FLUSH_CONTEXT: u32 = 0x0000_0165;
-const CC_POLICY_AUTH_VALUE: u32 = 0x0000_016b;
 const CC_START_AUTH_SESSION: u32 = 0x0000_0176;
 const CC_GET_CAPABILITY: u32 = 0x0000_017a;
 const CC_PCR_READ: u32 = 0x0000_017e;
@@ -173,17 +172,13 @@ impl Tpm {
 	/// -- which authorizes nothing and exists to compute exactly this -- and let
 	/// the TPM build the policy from the PCRs as they are right now.
 	///
-	/// `use_pin` mirrors `tpm2_calculate_sealing_policy()`: PolicyPCR, then
-	/// PolicyAuthValue when the enrollment carries a PIN.
-	pub fn pcr_policy_digest(
-		&mut self,
-		bank: Bank,
-		indices: &[u8],
-		use_pin: bool,
-	) -> Result<Vec<u8>, String> {
+	/// PolicyPCR alone, which is what `tpm2_calculate_sealing_policy()` builds
+	/// for an enrollment with no PIN, public key or pcrlock -- the only kind the
+	/// preflight lets through.
+	pub fn pcr_policy_digest(&mut self, bank: Bank, indices: &[u8]) -> Result<Vec<u8>, String> {
 		let session = self.start_trial_session()?;
 
-		let result = self.build_policy(session, bank, indices, use_pin);
+		let result = self.build_policy(session, bank, indices);
 
 		// The session occupies one of a small number of TPM slots, so release it
 		// whether or not the policy worked out.
@@ -199,7 +194,6 @@ impl Tpm {
 		session: u32,
 		bank: Bank,
 		indices: &[u8],
-		use_pin: bool,
 	) -> Result<Vec<u8>, String> {
 		let mut body = Vec::new();
 		put_u32(&mut body, session);
@@ -209,12 +203,6 @@ impl Tpm {
 		put_u16(&mut body, 0);
 		put_pcr_selection(&mut body, bank, indices);
 		self.transact(CC_POLICY_PCR, &body)?;
-
-		if use_pin {
-			let mut body = Vec::new();
-			put_u32(&mut body, session);
-			self.transact(CC_POLICY_AUTH_VALUE, &body)?;
-		}
 
 		let mut body = Vec::new();
 		put_u32(&mut body, session);

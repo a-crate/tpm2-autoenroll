@@ -19,6 +19,8 @@
 #      cache without a second prompt (section 5).
 #   5. A header whose PCR selection disagrees with the config is left alone
 #      without a consent prompt, since the header is not a source of policy.
+#   6. So is a PIN enrollment, which a repair would make TPM-only, and so is
+#      any volume on a machine set up for a signed PCR policy.
 #
 # PCR 16 is the debug PCR: extendable from userspace, which lets us manufacture
 # the policy mismatch in place. No reboot and no boot loader, so the test is
@@ -34,6 +36,7 @@ let
     autotest = "/dev/vdb";
     autotest2 = "/dev/vdc";
     autotest3 = "/dev/vdd";
+    autotest4 = "/dev/vde";
   };
 
   answerPassphrase = import ./answer-passphrase.nix { inherit pkgs; };
@@ -43,7 +46,7 @@ pkgs.testers.runNixOSTest {
 
   nodes.machine = { lib, pkgs, ... }: {
     virtualisation.tpm.enable = true;
-    virtualisation.emptyDiskImages = [ 512 512 512 ];
+    virtualisation.emptyDiskImages = [ 512 512 512 512 ];
     virtualisation.memorySize = 2048;
 
     environment.systemPackages = [
@@ -131,6 +134,10 @@ pkgs.testers.runNixOSTest {
     UNIT = f"systemd-cryptsetup@{VOLUME}.service"
     UNIT2 = f"systemd-cryptsetup@{VOLUME2}.service"
     UNIT3 = f"systemd-cryptsetup@{VOLUME3}.service"
+    VOLUME4 = "autotest4"
+    DEVICE4 = "/dev/vde"
+    UNIT4 = f"systemd-cryptsetup@{VOLUME4}.service"
+    PIN = "1234"
     CRYPTENROLL = "${pkgs.systemd}/bin/systemd-cryptenroll"
     DROPIN_DIR = f"/run/systemd/system/{UNIT}.d"
 
@@ -514,6 +521,100 @@ pkgs.testers.runNixOSTest {
             f"cryptsetup luksDump {DEVICE3} digest was {before} before and "
             f"{after} after, expected them to be equal"
         )
+        machine.succeed(f"systemctl stop {UNIT3}")
+
+    with subtest("a drifted PIN enrollment is left alone rather than made TPM-only"):
+        # Re-enrolling without the PIN would unlock with the TPM alone, and the
+        # verification would happily confirm that.
+        machine.succeed(
+            f"echo -n {PASSPHRASE} | cryptsetup luksFormat --type luks2 "
+            f"--pbkdf pbkdf2 --pbkdf-force-iterations 1000 --batch-mode {DEVICE4} -"
+        )
+        machine.succeed(
+            f"PASSWORD={PASSPHRASE} NEWPIN={PIN} {CRYPTENROLL} "
+            f"--tpm2-device=auto --tpm2-pcrs=16 --tpm2-with-pin=yes {DEVICE4}"
+        )
+        machine.succeed(
+            "tpm2_pcrextend 16:sha256=$(head -c32 /dev/urandom | sha256sum | cut -d' ' -f1)"
+        )
+        # The correct PIN every time it is asked for, so the TPM2 attempts fail
+        # on the policy alone. The token plugin reads it from $PIN; the
+        # built-in TPM2 path systemd-cryptsetup falls back to afterwards does
+        # not, and prompts once instead.
+        pin_dropin = f"/run/systemd/system/{UNIT4}.d"
+        machine.succeed(f"mkdir -p {pin_dropin}")
+        machine.succeed(
+            f"printf '[Service]\\nEnvironment=PIN={PIN}\\n' > {pin_dropin}/pin.conf"
+        )
+        machine.succeed("systemctl daemon-reload")
+
+        before = header_digest(DEVICE4)
+        watch = LogWatch()
+
+        # The PIN is systemd-cryptsetup's prompt; the passphrase comes from our
+        # cache, so there is nothing else to answer.
+        machine.succeed(f"systemctl start --no-block {UNIT4}")
+        machine.succeed(f"answer-passphrase {PIN}")
+        machine.wait_until_succeeds(f"test -b /dev/mapper/{VOLUME4}", timeout=120)
+
+        log = watch.new()
+        assert "plain phase" in log, (
+            f"unlocking the drifted PIN volume produced:\n{log}\n"
+            "expected a 'plain phase' line"
+        )
+        expected = "the enrollment requires a TPM2 PIN, which a repair would silently drop"
+        assert expected in log, (
+            f"unlocking the drifted PIN volume produced:\n{log}\n"
+            f"expected a {expected!r} line"
+        )
+        assert "can be repaired" not in log, (
+            f"unlocking the drifted PIN volume produced:\n{log}\n"
+            "expected no 'can be repaired' line"
+        )
+        pending = pending_password_requests()
+        assert pending == "", (
+            f"pending_password_requests() returned {pending!r}, expected an "
+            "empty string: a PIN enrollment must not produce a consent prompt"
+        )
+        after = header_digest(DEVICE4)
+        assert before == after, (
+            f"cryptsetup luksDump {DEVICE4} digest was {before} before and "
+            f"{after} after, expected them to be equal"
+        )
+        machine.succeed(f"systemctl stop {UNIT4}")
+        machine.succeed(f"rm -rf {pin_dropin} && systemctl daemon-reload")
+
+    with subtest("a public key on the host stops a repair"):
+        # systemd-cryptenroll would add a signed policy on its own when it
+        # finds one of these, so its presence means the user wants a policy
+        # this tool does not produce. autotest3 is drifted by the extend above.
+        pem = "/run/systemd/tpm2-pcr-public-key.pem"
+        machine.succeed(f"touch {pem}")
+        before = header_digest(DEVICE3)
+        watch = LogWatch()
+
+        # --no-ask-password keeps systemctl's console agent out of the way, so
+        # a stray prompt becomes a timeout rather than garbled driver output.
+        machine.succeed(f"timeout 120 systemctl --no-ask-password start {UNIT3}")
+        machine.succeed(f"test -b /dev/mapper/{VOLUME3}")
+
+        log = watch.new()
+        expected = f"{pem} exists, so this machine expects a policy this tool does not produce"
+        assert expected in log, (
+            f"unlocking autotest3 with {pem} present produced:\n{log}\n"
+            f"expected a {expected!r} line"
+        )
+        pending = pending_password_requests()
+        assert pending == "", (
+            f"pending_password_requests() returned {pending!r}, expected an "
+            "empty string: nothing to consent to"
+        )
+        after = header_digest(DEVICE3)
+        assert before == after, (
+            f"cryptsetup luksDump {DEVICE3} digest was {before} before and "
+            f"{after} after, expected them to be equal"
+        )
+        machine.succeed(f"rm {pem}")
         machine.succeed(f"systemctl stop {UNIT3}")
 
     with subtest("consent accepted: the binding is repaired and verified"):

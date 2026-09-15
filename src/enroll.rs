@@ -42,6 +42,14 @@ pub fn run(
 		.arg("--wipe-slot=tpm2")
 		.arg(format!("--tpm2-device={tpm2_device}"))
 		.arg(format!("--tpm2-pcrs={}", pcr_spec(pcrs, bank.name())))
+		// systemd-cryptenroll adds a signed policy on its own whenever it finds
+		// tpm2-pcr-public-key.pem, and a pcrlock policy whenever it finds
+		// pcrlock.json; the empty values switch both searches off. The preflight
+		// already refuses when either file exists, so these make sure the policy
+		// we write is exactly the one the preflight checked.
+		.arg("--tpm2-public-key=")
+		.arg("--tpm2-pcrlock=")
+		.arg("--tpm2-with-pin=no")
 		.arg(device)
 		.stdin(Stdio::null())
 		.stdout(Stdio::null())

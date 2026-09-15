@@ -479,6 +479,19 @@ fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2:
 		return;
 	};
 
+	// The flags passed to systemd-cryptenroll should make this impossible;
+	// checking the result means a systemd that stops honouring them is noticed.
+	let wrong =
+		preflight::token_refusal(new).or_else(|| preflight::same_selection(new, config).err());
+	if let Some(why) = wrong {
+		error!(
+			"volume {volume:?}: re-enrolled as token {}, but {why}. The old binding is gone; \
+			 the passphrase still works",
+			new.index
+		);
+		return;
+	}
+
 	// --token-only refuses to fall back to a passphrase, so success here is a
 	// TPM2 unseal and nothing else.
 	match enroll::test_unseal(&config.device, new.index) {

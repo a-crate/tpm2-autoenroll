@@ -9,8 +9,10 @@
 //! | a TPM2 device answers | wiping the token when there is no TPM is pure loss |
 //! | it is not in dictionary-attack lockout | sealing succeeds, unsealing keeps failing, and we rewrite the header every boot |
 //! | exactly one systemd-tpm2 token | `--wipe-slot=tpm2` removes all of them; with two, one is someone else's working binding |
-//! | the header's selection and bank match the config | the header is unauthenticated; a mismatch is a manual re-enrollment or tampering |
+//! | no PIN | a repair would silently drop it, making the volume TPM-only |
 //! | the enrollment is a plain PCR policy | a signed or pcrlock policy is one we cannot recreate, so replacing it is a downgrade |
+//! | the header's selection and bank match the config | the header is unauthenticated; a mismatch is a manual re-enrollment or tampering |
+//! | no host public key or pcrlock.json | the machine uses a policy this tool does not produce, so a literal-PCR repair is the wrong one |
 //! | the volume has a token at all | nothing to repair |
 //! | the PCRs actually drifted | if they match, re-sealing changes nothing and the next boot fails identically |
 
@@ -87,9 +89,28 @@ fn absent() -> Decision {
 	)
 }
 
+/// `systemd-cryptenroll`'s search path for the signed-policy public key.
+const PUBLIC_KEY_PATHS: [&str; 4] = [
+	"/etc/systemd/tpm2-pcr-public-key.pem",
+	"/run/systemd/tpm2-pcr-public-key.pem",
+	"/usr/local/lib/systemd/tpm2-pcr-public-key.pem",
+	"/usr/lib/systemd/tpm2-pcr-public-key.pem",
+];
+
+/// `tpm2_pcrlock_search_file()`'s search path.
+const PCRLOCK_PATHS: [&str; 2] = ["/run/systemd/pcrlock.json", "/var/lib/systemd/pcrlock.json"];
+
 /// The ordinary case: one token, and the question is whether it has gone stale.
 fn drifted(token: &Tpm2Token, config: &Volume, tpm: &mut Tpm) -> Decision {
+	if let Some(why) = token_refusal(token) {
+		return Decision::Leave(why);
+	}
 	if let Err(why) = same_selection(token, config) {
+		return Decision::Leave(format!(
+			"{why}; refusing: this is a manual re-enrollment or tampering"
+		));
+	}
+	if let Some(why) = host_policy(|p| std::fs::symlink_metadata(p).is_ok()) {
 		return Decision::Leave(why);
 	}
 
@@ -110,13 +131,38 @@ fn drifted(token: &Tpm2Token, config: &Volume, tpm: &mut Tpm) -> Decision {
 	}
 }
 
-/// Does the header's selection agree with the config?
+/// A policy element a literal-PCR repair would drop. Also used to check the
+/// token a repair wrote.
+pub fn token_refusal(token: &Tpm2Token) -> Option<String> {
+	if token.pin {
+		return Some(
+			"the enrollment requires a TPM2 PIN, which a repair would silently drop".to_string(),
+		);
+	}
+	token
+		.advanced
+		.as_ref()
+		.map(|kind| format!("the enrollment uses {kind}, which this tool cannot recreate"))
+}
+
+/// Whether the machine is set up for a signed or pcrlock policy. Either means
+/// the literal-PCR policy we would write is not the one the user wants, even
+/// though `enroll::run` stops systemd-cryptenroll picking the files up.
+fn host_policy(exists: impl Fn(&str) -> bool) -> Option<String> {
+	PUBLIC_KEY_PATHS
+		.iter()
+		.chain(PCRLOCK_PATHS.iter())
+		.find(|p| exists(p))
+		.map(|p| format!("{p} exists, so this machine expects a policy this tool does not produce"))
+}
+
+/// Does the token's selection agree with the config?
 ///
 /// The header is not a source of policy, but a disagreement is still worth
 /// refusing over rather than silently overriding: either someone re-enrolled
 /// by hand against a selection the config does not know about, or the header
 /// has been rewritten offline to get the next repair sealed somewhere weaker.
-fn same_selection(token: &Tpm2Token, config: &Volume) -> Result<(), String> {
+pub fn same_selection(token: &Tpm2Token, config: &Volume) -> Result<(), String> {
 	// systemd omits the bank only for enrollments old enough to predate bank
 	// selection, which assumed sha256.
 	let header_bank = token.bank.as_deref().unwrap_or("sha256");
@@ -130,8 +176,7 @@ fn same_selection(token: &Tpm2Token, config: &Volume) -> Result<(), String> {
 		config::pcr_list(&token.pcrs)
 	};
 	Err(format!(
-		"the header's PCR selection {header_pcrs} ({header_bank}) differs from the configured {} ({}); \
-		 refusing: this is a manual re-enrollment or tampering",
+		"the header's PCR selection {header_pcrs} ({header_bank}) differs from the configured {} ({})",
 		config::pcr_list(&config.pcrs),
 		config.bank.name()
 	))
@@ -184,6 +229,44 @@ mod tests {
 		assert!(
 			matches!(actual, Decision::Leave(_)),
 			"absent() returned {actual:?}, expected Decision::Leave(_)"
+		);
+	}
+
+	#[test]
+	fn refuses_a_pin_or_an_advanced_policy() {
+		let mut pin = token(&[7], None);
+		pin.pin = true;
+		let mut signed = token(&[7], None);
+		signed.advanced = Some("a signed PCR policy".to_string());
+		for (t, why) in [(pin, "PIN"), (signed, "signed policy")] {
+			let actual = token_refusal(&t);
+			assert!(
+				actual.is_some(),
+				"token_refusal({t:?}) returned None, expected Some ({why})"
+			);
+		}
+
+		let plain = token(&[7], None);
+		let actual = token_refusal(&plain);
+		assert_eq!(
+			actual, None,
+			"token_refusal({plain:?}) returned {actual:?}, expected None"
+		);
+	}
+
+	#[test]
+	fn refuses_when_the_host_has_a_public_key_or_pcrlock_policy() {
+		for path in PUBLIC_KEY_PATHS.iter().chain(PCRLOCK_PATHS.iter()) {
+			let actual = host_policy(|p| p == *path);
+			assert!(
+				actual.as_deref().is_some_and(|a| a.contains(path)),
+				"host_policy(<only {path} exists>) returned {actual:?}, expected Some naming it"
+			);
+		}
+		let actual = host_policy(|_| false);
+		assert_eq!(
+			actual, None,
+			"host_policy(<nothing exists>) returned {actual:?}, expected None"
 		);
 	}
 
