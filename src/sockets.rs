@@ -24,17 +24,42 @@ pub fn path(dir: &str, volume: &str) -> String {
 }
 
 /// 0700, because the sockets under it hand out passphrases. An existing
-/// directory is left as it is: on a system-stage boot systemd-cryptsetup may
-/// have created it, and fighting over its mode is not our business.
+/// directory is not re-moded -- on a system-stage boot something else may have
+/// created it -- but it has to be one only root could have made and only root
+/// can write to. Otherwise someone else could swap a socket of their own in
+/// for ours and be handed systemd-cryptsetup's connection.
 pub fn ensure_dir(dir: &str) -> Result<(), String> {
 	match rustix::fs::mkdir(dir, Mode::RWXU) {
 		Ok(()) => {
 			// mkdir's mode is masked by the umask, which we do not control.
 			rustix::fs::chmod(dir, Mode::RWXU).map_err(|e| format!("chmod {dir}: {e}"))
 		}
-		Err(rustix::io::Errno::EXIST) => Ok(()),
+		Err(rustix::io::Errno::EXIST) => check_existing(dir, 0),
 		Err(e) => Err(format!("mkdir {dir}: {e}")),
 	}
+}
+
+/// A real directory rather than a symlink to one, owned by `owner`, and
+/// writable by nobody else.
+fn check_existing(dir: &str, owner: u32) -> Result<(), String> {
+	let stat = rustix::fs::lstat(dir).map_err(|e| format!("stat {dir}: {e}"))?;
+	let mode = stat.st_mode as u32;
+	if FileType::from_raw_mode(mode) != FileType::Directory {
+		return Err(format!("{dir} exists and is not a directory"));
+	}
+	if stat.st_uid != owner {
+		return Err(format!(
+			"{dir} is owned by uid {}, expected {owner}",
+			stat.st_uid
+		));
+	}
+	if mode & 0o022 != 0 {
+		return Err(format!(
+			"{dir} has mode {:o}, which lets others write to it",
+			mode & 0o7777
+		));
+	}
+	Ok(())
 }
 
 pub fn bind(path: &str) -> Result<OwnedFd, String> {
@@ -120,6 +145,45 @@ mod tests {
 		);
 
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn an_existing_directory_must_be_private() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let base = format!("/tmp/tpm2-autoenroll-existing-{}", std::process::id());
+		let _ = std::fs::remove_dir_all(&base);
+		std::fs::create_dir(&base).expect("could not create the test directory");
+		let me = rustix::process::geteuid().as_raw();
+
+		let private = format!("{base}/private");
+		std::fs::create_dir(&private).expect("could not create the private directory");
+		std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+			.expect("could not chmod the private directory");
+		let writable = format!("{base}/writable");
+		std::fs::create_dir(&writable).expect("could not create the writable directory");
+		std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777))
+			.expect("could not chmod the writable directory");
+		let link = format!("{base}/link");
+		std::os::unix::fs::symlink(&private, &link).expect("could not create the symlink");
+
+		let cases = [
+			(private.as_str(), me, true, "private and ours"),
+			(writable.as_str(), me, false, "world-writable"),
+			(link.as_str(), me, false, "a symlink to a private directory"),
+			(private.as_str(), me + 1, false, "owned by someone else"),
+		];
+		for (dir, owner, expected, why) in cases {
+			let actual = check_existing(dir, owner);
+			assert_eq!(
+				actual.is_ok(),
+				expected,
+				"check_existing({dir:?}, {owner}) returned {actual:?}, expected {} ({why})",
+				if expected { "Ok" } else { "Err" }
+			);
+		}
+
+		let _ = std::fs::remove_dir_all(&base);
 	}
 
 	#[test]
