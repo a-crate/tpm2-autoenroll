@@ -388,10 +388,10 @@ pkgs.testers.runNixOSTest {
             "expected an 'attempt 1 of 3' line, meaning the wrong passphrase "
             "was caught by validation and re-asked here rather than returned"
         )
-        returned = re.findall(r"returned a passphrase of \d+ bytes", log)
-        assert len(returned) == 1, (
+        returned = log.count("returned the passphrase")
+        assert returned == 1, (
             f"the new daemon output was:\n{log}\n"
-            f"expected exactly one 'returned a passphrase of N bytes' line, got {len(returned)}: "
+            f"expected exactly one 'returned the passphrase' line, got {returned}: "
             "only the validated passphrase may be handed to systemd-cryptsetup"
         )
 

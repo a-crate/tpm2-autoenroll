@@ -699,10 +699,9 @@ fn acquire(volume: &str, config: &Volume, cache: &mut Cache) -> Option<Secret> {
 /// stray newline is a rejected passphrase.
 fn reply(conn: OwnedFd, volume: &str, secret: &Secret) {
 	match write_all(&conn, secret.as_bytes()) {
-		Ok(()) => info!(
-			"volume {volume:?}: returned a passphrase of {} bytes",
-			secret.len()
-		),
+		// No length: the journal is persistent and group-readable, and a
+		// passphrase's length narrows a brute-force search.
+		Ok(()) => info!("volume {volume:?}: returned the passphrase"),
 		Err(e) => error!("volume {volume:?}: could not write the passphrase ({e})"),
 	}
 }

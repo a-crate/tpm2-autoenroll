@@ -57,10 +57,11 @@ impl PartialEq for Secret {
 impl Eq for Secret {}
 
 /// A redaction, so a `Secret` reached by an accidental `{:?}` on an enclosing
-/// struct cannot leak the passphrase into the journal.
+/// struct cannot leak the passphrase into the journal -- not even its length,
+/// which narrows a brute-force search.
 impl fmt::Debug for Secret {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "Secret({} bytes)", self.0.len())
+		f.write_str("Secret(redacted)")
 	}
 }
 
@@ -77,8 +78,8 @@ mod tests {
 			"format!(\"{{:?}}\", Secret::new(b\"hunter2\")) returned {actual:?}, expected a redaction containing no passphrase bytes"
 		);
 		assert_eq!(
-			actual, "Secret(7 bytes)",
-			"format!(\"{{:?}}\", Secret::new(b\"hunter2\")) returned {actual:?}, expected \"Secret(7 bytes)\""
+			actual, "Secret(redacted)",
+			"format!(\"{{:?}}\", Secret::new(b\"hunter2\")) returned {actual:?}, expected \"Secret(redacted)\""
 		);
 	}
 
