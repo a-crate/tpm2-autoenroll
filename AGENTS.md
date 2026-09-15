@@ -44,7 +44,7 @@ On each connection, the peer's abstract AF_UNIX bind name (`bindname.rs`) shows 
 
 Connections are handled one at a time. This is deliberate: parallel prompts would interleave on the console, and serial handling is what lets the passphrase cache help the next volume.
 
-On SIGTERM the daemon unlinks its sockets. `/run` survives switch-root, so a leftover socket would be found by stage 2.
+The daemon exits once every configured volume is open (`dm.rs`) or has been answered in the plain phase, or after 5 minutes with no connection, so the passphrase cache does not outlive the unlock. The `Wants=` drop-in starts it again for any later `systemd-cryptsetup@` start, with an empty cache and no remembered consent. On that exit, and on SIGTERM, the daemon unlinks its sockets. `/run` survives switch-root, so a leftover socket would be found by stage 2.
 
 ### Invariants to preserve
 

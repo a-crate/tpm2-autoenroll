@@ -21,6 +21,9 @@
 #      without a consent prompt, since the header is not a source of policy.
 #   6. So is a PIN enrollment, which a repair would make TPM-only, and so is
 #      any volume on a machine set up for a signed PCR policy.
+#   7. Once every configured volume has been served the daemon exits, taking
+#      its sockets and its passphrase cache with it, and the next unlock
+#      starts it again.
 #
 # PCR 16 is the debug PCR: extendable from userspace, which lets us manufacture
 # the policy mismatch in place. No reboot and no boot loader, so the test is
@@ -80,13 +83,20 @@ pkgs.testers.runNixOSTest {
     };
 
 
-    # wantedBy multi-user.target rather than the module's drop-in on
-    # systemd-cryptsetup@.service: this test drives the cryptsetup units by
-    # hand, and what is under test is the daemon rather than the wiring.
-    # moduletest.nix covers the wiring.
+    # The same Wants=/After= drop-in the module installs: the daemon exits once
+    # it has served every volume, and this is what brings it back for the next
+    # unlock. The test still drives the cryptsetup units by hand.
+    systemd.units."systemd-cryptsetup@.service" = {
+      overrideStrategy = "asDropin";
+      text = ''
+        [Unit]
+        Wants=tpm2-autoenrolld.service
+        After=tpm2-autoenrolld.service
+      '';
+    };
+
     systemd.services.tpm2-autoenrolld = {
       description = "TPM2 auto-enrollment key agent";
-      wantedBy = [ "multi-user.target" ];
       before = [ "cryptsetup-pre.target" ];
       unitConfig.DefaultDependencies = "no";
       # The package carries no PATH of its own, so the caller names the three
@@ -264,7 +274,9 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_file("/dev/tpmrm0")
-    machine.wait_for_unit("tpm2-autoenrolld.service")
+    # Nothing wants the daemon until a volume is started, so bring it up by
+    # hand to look at its sockets.
+    machine.succeed("systemctl start tpm2-autoenrolld.service")
 
     with subtest("the daemon bound a socket for every configured volume"):
         mode = machine.succeed("stat -c %a /run/cryptsetup-keys.d").strip()
@@ -272,7 +284,7 @@ pkgs.testers.runNixOSTest {
             f"stat -c %a /run/cryptsetup-keys.d returned {mode!r}, expected "
             "'700': the daemon creates the directory it listens in"
         )
-        for volume in (VOLUME, VOLUME2, VOLUME3):
+        for volume in (VOLUME, VOLUME2, VOLUME3, VOLUME4):
             machine.succeed(f"test -S /run/cryptsetup-keys.d/{volume}.key")
         mode = machine.succeed(
             f"stat -c %a /run/cryptsetup-keys.d/{VOLUME}.key"
@@ -584,7 +596,21 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"systemctl stop {UNIT4}")
         machine.succeed(f"rm -rf {pin_dropin} && systemctl daemon-reload")
 
-    with subtest("a public key on the host stops a repair"):
+    with subtest("once every configured volume has been served, the daemon exits"):
+        # autotest4 was the last of the four to be answered in the plain
+        # phase, so the daemon has nothing left to wait for. Its sockets go,
+        # and the passphrase cache goes with the process.
+        machine.wait_until_fails("systemctl is-active tpm2-autoenrolld.service", timeout=30)
+        for volume in (VOLUME, VOLUME2, VOLUME3, VOLUME4):
+            machine.fail(f"test -e /run/cryptsetup-keys.d/{volume}.key")
+        log = "\n".join(daemon_log_lines())
+        expected = "every configured volume is open or has been answered"
+        assert expected in log, (
+            f"the daemon output was:\n{log}\n"
+            f"expected a {expected!r} line explaining why it exited"
+        )
+
+    with subtest("the next unlock brings the daemon back, and a public key on the host stops a repair"):
         # systemd-cryptenroll would add a signed policy on its own when it
         # finds one of these, so its presence means the user wants a policy
         # this tool does not produce. autotest3 is drifted by the extend above.
@@ -593,12 +619,24 @@ pkgs.testers.runNixOSTest {
         before = header_digest(DEVICE3)
         watch = LogWatch()
 
-        # --no-ask-password keeps systemctl's console agent out of the way, so
-        # a stray prompt becomes a timeout rather than garbled driver output.
-        machine.succeed(f"timeout 120 systemctl --no-ask-password start {UNIT3}")
-        machine.succeed(f"test -b /dev/mapper/{VOLUME3}")
+        # The drop-in starts a fresh daemon with an empty cache, so the
+        # passphrase has to be typed again.
+        machine.succeed(f"systemctl start --no-block {UNIT3}")
+        machine.succeed(f"answer-passphrase {PASSPHRASE}")
+        machine.wait_until_succeeds(f"test -b /dev/mapper/{VOLUME3}", timeout=120)
+
+        state = machine.succeed("systemctl is-active tpm2-autoenrolld.service").strip()
+        assert state == "active", (
+            f"systemctl is-active tpm2-autoenrolld.service returned {state!r}, "
+            "expected 'active': starting a volume must bring the daemon back"
+        )
 
         log = watch.new()
+        assert "seen earlier this boot" not in log, (
+            f"unlocking autotest3 with a fresh daemon produced:\n{log}\n"
+            "expected no cached passphrase: the cache must not outlive the "
+            "process that held it"
+        )
         expected = f"{pem} exists, so this machine expects a policy this tool does not produce"
         assert expected in log, (
             f"unlocking autotest3 with {pem} present produced:\n{log}\n"

@@ -17,12 +17,20 @@
 //! The invariant underneath it is enroll at the point of unlock: the PCR values
 //! read when we are consulted are, by construction, the values present the next
 //! time this volume is unlocked at this same point in boot.
+//!
+//! The daemon exits once every configured volume is open or has been answered
+//! in the plain phase, or after a stretch with no connections, taking the
+//! passphrase cache and consent decisions with it. That bounds how long a
+//! passphrase sits in memory where any root process that can reach the socket
+//! might ask for it. A later `systemd-cryptsetup@` start pulls the daemon in
+//! again through the `Wants=` drop-in, with both empty; that is intended.
 
 mod askpw;
 mod bindname;
 mod cache;
 mod config;
 mod consent;
+mod dm;
 mod drift;
 mod enroll;
 mod log;
@@ -35,9 +43,12 @@ mod sockets;
 mod token;
 mod tpm2;
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 use rustix::net::{SocketAddrAny, SocketAddrUnix};
@@ -54,6 +65,13 @@ use crate::secret::Secret;
 /// How many times we ask before handing the prompt back to systemd-cryptsetup.
 /// Matches `arg_tries` (cryptsetup.c:87).
 const TRIES: usize = 3;
+
+/// How long the accept loop sleeps before re-checking whether it is finished.
+const TICK: Duration = Duration::from_secs(1);
+
+/// Backstop for volumes that never report in: a `noauto` volume nobody starts,
+/// or a config entry that matches no crypttab line.
+const IDLE_LIMIT: Duration = Duration::from_secs(300);
 
 struct Listener {
 	fd: OwnedFd,
@@ -234,7 +252,8 @@ fn unix_addr(addr: &SocketAddrAny) -> Option<SocketAddrUnix> {
 	SocketAddrUnix::try_from(addr.clone()).ok()
 }
 
-/// Accept and answer connections, one at a time, forever.
+/// Accept and answer connections, one at a time, until `finished` says the
+/// daemon is no longer needed.
 ///
 /// Serial handling is a requirement rather than a simplification: several
 /// `systemd-cryptsetup@.service` instances can be unlocking in parallel, and two
@@ -244,14 +263,27 @@ fn unix_addr(addr: &SocketAddrAny) -> Option<SocketAddrUnix> {
 fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 	let mut cache = Cache::new();
 	let mut decided = consent::Decisions::new();
+	let mut served: HashSet<String> = HashSet::new();
+	let mut last_contact = Instant::now();
+	let tick = rustix::event::Timespec {
+		tv_sec: TICK.as_secs() as _,
+		tv_nsec: 0,
+	};
 
 	loop {
+		let volumes = listeners.iter().map(|l| l.volume.name.as_str());
+		let active = |v: &str| dm::is_active(Path::new(dm::SYS_BLOCK), v);
+		if let Some(why) = finished(volumes, &served, active, last_contact.elapsed()) {
+			notice!("{why}; removing the key sockets and exiting");
+			return std::process::ExitCode::SUCCESS;
+		}
+
 		let mut polls: Vec<PollFd> = listeners
 			.iter()
 			.map(|l| PollFd::new(&l.fd, PollFlags::IN))
 			.collect();
 
-		let woken = rustix::event::poll(&mut polls, None);
+		let woken = rustix::event::poll(&mut polls, Some(&tick));
 
 		if TERMINATE.load(Ordering::Relaxed) {
 			notice!("asked to stop; removing the key sockets");
@@ -277,12 +309,41 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 		for i in ready {
 			let l = &listeners[i];
 			match rustix::net::accept(&l.fd) {
-				Ok(conn) => handle(conn, &l.volume, &mut cache, &mut decided),
+				Ok(conn) => {
+					if handle(conn, &l.volume, &mut cache, &mut decided) {
+						served.insert(l.volume.name.clone());
+					}
+					last_contact = Instant::now();
+				}
 				Err(rustix::io::Errno::INTR) | Err(rustix::io::Errno::AGAIN) => {}
 				Err(e) => error!("volume {:?}: accept failed: {e}", l.volume.name),
 			}
 		}
 	}
+}
+
+/// Why the daemon can stop, if it can.
+///
+/// A volume is done once it is open, or once its plain-phase connection has
+/// been handled -- whatever came of it, since systemd-cryptsetup does not ask
+/// twice. A TPM-phase connection alone does not count: a plain-phase one may
+/// follow.
+fn finished<'a>(
+	volumes: impl IntoIterator<Item = &'a str>,
+	served: &HashSet<String>,
+	active: impl Fn(&str) -> bool,
+	idle: Duration,
+) -> Option<String> {
+	if volumes.into_iter().all(|v| served.contains(v) || active(v)) {
+		return Some("every configured volume is open or has been answered".to_string());
+	}
+	if idle >= IDLE_LIMIT {
+		return Some(format!(
+			"no connection for {} seconds",
+			IDLE_LIMIT.as_secs()
+		));
+	}
+	None
 }
 
 /// Answer one connection.
@@ -291,7 +352,14 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 /// it having written nothing -- the zero-byte decline. That is the fail-closed
 /// default: anything we cannot make sense of degrades to stock
 /// systemd-cryptsetup behaviour rather than being guessed at.
-fn handle(conn: OwnedFd, managed: &Volume, cache: &mut Cache, decided: &mut consent::Decisions) {
+///
+/// True when this was the volume's plain-phase connection and it was handled.
+fn handle(
+	conn: OwnedFd,
+	managed: &Volume,
+	cache: &mut Cache,
+	decided: &mut consent::Decisions,
+) -> bool {
 	let volume = managed.name.as_str();
 
 	// systemd-cryptsetup always binds a name of its own, so an unnamed peer is
@@ -300,24 +368,24 @@ fn handle(conn: OwnedFd, managed: &Volume, cache: &mut Cache, decided: &mut cons
 		Ok(Some(p)) => p,
 		Ok(None) => {
 			warning!("volume {volume:?}: peer is unnamed; declining");
-			return;
+			return false;
 		}
 		Err(e) => {
 			warning!("volume {volume:?}: getpeername failed ({e}); declining");
-			return;
+			return false;
 		}
 	};
 
 	let Some(unix) = unix_addr(&peer) else {
 		warning!("volume {volume:?}: peer is not an AF_UNIX address; declining");
-		return;
+		return false;
 	};
 
 	// The abstract name's bytes are not NUL-terminated; rustix hands us the
 	// slice with its real length.
 	let Some(name) = unix.abstract_name() else {
 		warning!("volume {volume:?}: peer is not in the abstract namespace; declining");
-		return;
+		return false;
 	};
 
 	let Some(peer_name) = bindname::parse(name) else {
@@ -325,7 +393,7 @@ fn handle(conn: OwnedFd, managed: &Volume, cache: &mut Cache, decided: &mut cons
 			"volume {volume:?}: unparseable peer name {:?}; declining",
 			String::from_utf8_lossy(name)
 		);
-		return;
+		return false;
 	};
 
 	if peer_name.volume != volume.as_bytes() {
@@ -333,16 +401,20 @@ fn handle(conn: OwnedFd, managed: &Volume, cache: &mut Cache, decided: &mut cons
 			"volume {volume:?}: peer asked for volume {:?}; declining",
 			String::from_utf8_lossy(peer_name.volume)
 		);
-		return;
+		return false;
 	}
 
 	match peer_name.phase {
-		Phase::Plain => serve_passphrase(conn, managed, cache, decided),
+		Phase::Plain => {
+			serve_passphrase(conn, managed, cache, decided);
+			true
+		}
 		phase => {
 			info!(
 				"volume {volume:?}: {} phase, declining with zero bytes",
 				phase.as_str()
 			);
+			false
 		}
 	}
 }
@@ -619,4 +691,53 @@ fn write_all(fd: &OwnedFd, mut buf: &[u8]) -> Result<(), rustix::io::Errno> {
 		}
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn served(names: &[&str]) -> HashSet<String> {
+		names.iter().map(|n| n.to_string()).collect()
+	}
+
+	#[test]
+	fn finishes_once_every_volume_is_open_or_answered() {
+		let volumes = ["root", "home", "swap"];
+		let cases: [(&[&str], &[&str], bool); 5] = [
+			(&[], &[], false),
+			(&["root"], &[], false),
+			(&["root", "home"], &["swap"], true),
+			(&[], &["root", "home", "swap"], true),
+			(&["root", "home", "swap"], &[], true),
+		];
+		for (answered, open, expected) in cases {
+			let actual = finished(
+				volumes,
+				&served(answered),
+				|v| open.contains(&v),
+				Duration::ZERO,
+			)
+			.is_some();
+			assert_eq!(
+				actual, expected,
+				"finished({volumes:?}, served = {answered:?}, open = {open:?}, idle = 0) returned {actual}, expected {expected}"
+			);
+		}
+	}
+
+	#[test]
+	fn finishes_after_the_idle_limit() {
+		let cases = [
+			(IDLE_LIMIT - Duration::from_secs(1), false),
+			(IDLE_LIMIT, true),
+		];
+		for (idle, expected) in cases {
+			let actual = finished(["root"], &served(&[]), |_| false, idle).is_some();
+			assert_eq!(
+				actual, expected,
+				"finished([\"root\"], served = [], open = [], idle = {idle:?}) returned {actual}, expected {expected}"
+			);
+		}
+	}
 }
