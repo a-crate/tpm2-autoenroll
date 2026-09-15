@@ -14,6 +14,10 @@ pub fn ready() {
 	let Ok(socket) = std::env::var("NOTIFY_SOCKET") else {
 		return;
 	};
+	// Every child would otherwise inherit it. sd_notify(3)'s unset_environment
+	// does the same. The daemon is single-threaded, so this cannot race a
+	// getenv.
+	std::env::remove_var("NOTIFY_SOCKET");
 
 	if let Err(e) = send(&socket, b"READY=1\n") {
 		// Not fatal, but it looks like a startup hang from the outside.
