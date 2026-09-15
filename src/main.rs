@@ -101,6 +101,7 @@ fn main() -> std::process::ExitCode {
 	};
 
 	lock_memory();
+	set_undumpable();
 	catch_sigterm();
 
 	// No config means no sockets, and no sockets means stock behaviour: the
@@ -244,6 +245,23 @@ fn lock_memory() {
 	if rc != 0 {
 		warning!(
 			"mlockall failed ({}); key material may reach swap",
+			std::io::Error::last_os_error()
+		);
+	}
+}
+
+/// Keep the cache out of core dumps.
+///
+/// `panic = "abort"` turns any panic into SIGABRT, and in stage 2
+/// systemd-coredump would write our memory to disk. Not dumpable also refuses
+/// same-uid ptrace without CAP_SYS_PTRACE. Warned about rather than fatal, like
+/// `lock_memory`.
+fn set_undumpable() {
+	// SAFETY: PR_SET_DUMPABLE takes integers only and touches no memory of ours.
+	let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+	if rc != 0 {
+		warning!(
+			"prctl(PR_SET_DUMPABLE, 0) failed ({}); key material may reach a core dump",
 			std::io::Error::last_os_error()
 		);
 	}
@@ -731,6 +749,17 @@ mod tests {
 				"finished({volumes:?}, served = {answered:?}, open = {open:?}, idle = 0) returned {actual}, expected {expected}"
 			);
 		}
+	}
+
+	#[test]
+	fn set_undumpable_clears_the_dumpable_flag() {
+		set_undumpable();
+		// SAFETY: PR_GET_DUMPABLE takes no arguments that point anywhere.
+		let actual = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+		assert_eq!(
+			actual, 0,
+			"set_undumpable() then prctl(PR_GET_DUMPABLE) returned {actual}, expected 0"
+		);
 	}
 
 	#[test]

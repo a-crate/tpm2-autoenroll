@@ -89,6 +89,7 @@ let
       Type = "notify";
       NotifyAccess = "main";
       ExecStart = "${lib.getExe cfg.package} --config=${configPath}";
+      LimitCORE = "0";
     };
   };
 
