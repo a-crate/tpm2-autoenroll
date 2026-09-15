@@ -106,7 +106,8 @@ fn token(index: u32, value: &Value) -> Result<Tpm2Token, String> {
 	// cannot reproduce: a signed policy authorizes over a public key, and
 	// pcrlock authorizes against an NV index. Recognising them is how we avoid
 	// mistaking "we cannot compute this" for "the PCRs drifted".
-	let advanced = if value.get("tpm2_pubkey").is_some() || value.get("tpm2_pubkey_pcrs").is_some() {
+	let advanced = if value.get("tpm2_pubkey").is_some() || value.get("tpm2_pubkey_pcrs").is_some()
+	{
 		Some("a signed PCR policy")
 	} else if value.get("tpm2_pcrlock").and_then(Value::as_bool) == Some(true) {
 		Some("a pcrlock policy")
@@ -125,18 +126,21 @@ fn token(index: u32, value: &Value) -> Result<Tpm2Token, String> {
 }
 
 fn pcr_list(value: &Value) -> Result<Vec<u8>, String> {
-	let list = value
-		.as_array()
-		.ok_or("\"tpm2-pcrs\" is not an array")?;
+	let list = value.as_array().ok_or("\"tpm2-pcrs\" is not an array")?;
 	let mut out = Vec::with_capacity(list.len());
 	for item in list {
-		let n = item.as_u64().ok_or("\"tpm2-pcrs\" contains a non-integer")?;
+		let n = item
+			.as_u64()
+			.ok_or("\"tpm2-pcrs\" contains a non-integer")?;
 		if n > 23 {
-			return Err(format!("\"tpm2-pcrs\" contains {n}, which is not a PCR index"));
+			return Err(format!(
+				"\"tpm2-pcrs\" contains {n}, which is not a PCR index"
+			));
 		}
 		out.push(n as u8);
 	}
 	out.sort_unstable();
+	out.dedup();
 	Ok(out)
 }
 

@@ -13,6 +13,8 @@
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 
+use crate::tpm2::Bank;
+
 const BINARY: &str = "systemd-ask-password";
 
 /// Answers already given, keyed by PCR set, so volumes sharing a boot state ask
@@ -45,22 +47,26 @@ impl Decisions {
 	}
 }
 
-#[derive(Debug)]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Answer {
-    No,
-    Yes,
-    Always,
+	No,
+	Yes,
+	Always,
 }
 
 /// Anything that is not an explicit yes is a no, including a timeout, a closed
 /// prompt, or an agent that failed outright. Declining leaves the volume in
 /// passphrase-only mode and the boot continues; assuming yes would re-bind to
 /// an attacker's boot chain.
-pub fn ask(volume: &str, device: &str) -> Answer {
+pub fn ask(volume: &str, device: &str, pcrs: &[u8], bank: Bank) -> Answer {
+	// Naming the selection means the human approves a specific policy rather
+	// than "whatever the tool decided".
 	let message = format!(
 		"Boot measurements for {volume} have changed since TPM2 enrollment. \
-		 Re-enroll TPM2 against the current state? [y(es)/n(o)/a(lways)]"
+		 Re-enroll TPM2 for {volume} against PCRs {} ({}) in their current state? \
+		 [y(es)/n(o)/a(lways)]",
+		crate::config::pcr_list(pcrs),
+		bank.name()
 	);
 
 	let out = Command::new(BINARY)
@@ -117,25 +123,25 @@ mod tests {
 
 	#[test]
 	fn classify_answers_correctly() {
-	    let cases: [(&[u8], Answer); 17] = [
-					(b"y".as_slice(), Answer::Yes),
-					(b"Y".as_slice(), Answer::Yes),
-					(b"yes".as_slice(), Answer::Yes),
-					(b"YES".as_slice(), Answer::Yes),
-					(b"a".as_slice(), Answer::Always),
-					(b"A".as_slice(), Answer::Always),
-					(b"always".as_slice(), Answer::Always),
-					(b"y\n".as_slice(), Answer::Yes),
-					(b"  y  ".as_slice(), Answer::Yes),
-					(b"", Answer::No),
-					(b"\n", Answer::No),
-					(b"n", Answer::No),
-					(b"no", Answer::No),
-					(b"yeah", Answer::No),
-					(b"ye s", Answer::No),
-					(b"1", Answer::No),
-					(b"all", Answer::No),
-					];
+		let cases: [(&[u8], Answer); 17] = [
+			(b"y".as_slice(), Answer::Yes),
+			(b"Y".as_slice(), Answer::Yes),
+			(b"yes".as_slice(), Answer::Yes),
+			(b"YES".as_slice(), Answer::Yes),
+			(b"a".as_slice(), Answer::Always),
+			(b"A".as_slice(), Answer::Always),
+			(b"always".as_slice(), Answer::Always),
+			(b"y\n".as_slice(), Answer::Yes),
+			(b"  y  ".as_slice(), Answer::Yes),
+			(b"", Answer::No),
+			(b"\n", Answer::No),
+			(b"n", Answer::No),
+			(b"no", Answer::No),
+			(b"yeah", Answer::No),
+			(b"ye s", Answer::No),
+			(b"1", Answer::No),
+			(b"all", Answer::No),
+		];
 		for (input, expect) in cases {
 			let actual = classify_response(input);
 			assert_eq!(

@@ -3,7 +3,7 @@
 //! This is what makes "the socket is listening before systemd-cryptsetup runs"
 //! true rather than merely likely. With `Type=exec` systemd considers the
 //! service started the moment the binary is executed, well before it has read
-//! the crypttab and bound anything, so ordering against it would guarantee
+//! its config and bound anything, so ordering against it would guarantee
 //! nothing.
 
 use rustix::net::{AddressFamily, SendFlags, SocketAddrUnix, SocketFlags, SocketType};

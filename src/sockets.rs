@@ -3,8 +3,7 @@
 //! `discover_key()` (cryptsetup.c:2562) searches `/etc/cryptsetup-keys.d` then
 //! `/run/cryptsetup-keys.d` for `<volume>.key`, and connects to it if it is a
 //! socket. We bind those sockets ourselves rather than through `ListenStream=`,
-//! because the set of volumes is not known until the crypttab has been read and
-//! a socket unit's listen list is fixed at build time. The daemon therefore owns
+//! so that a socket exists exactly as long as a daemon able to answer on it. The daemon therefore owns
 //! their whole lifetime, including removing them on the way out
 //! (`main::shutdown`).
 

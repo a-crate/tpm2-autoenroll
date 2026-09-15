@@ -36,39 +36,30 @@ impl Drift {
 				short(enrolled),
 				short(current)
 			),
-			Drift::Matches => {
-				"the current PCRs still satisfy the enrolled policy".to_string()
-			}
+			Drift::Matches => "the current PCRs still satisfy the enrolled policy".to_string(),
 			Drift::Unknown(why) => format!("cannot tell whether the PCRs drifted: {why}"),
 		}
 	}
 }
 
-/// Compare `token`'s sealed policy against the machine's present state.
-pub fn check(tpm: &mut Tpm, token: &Tpm2Token) -> Drift {
+/// Compare `token`'s sealed policy against what `pcrs` in `bank` produce now.
+///
+/// The selection comes from the config rather than the token: the token is
+/// only trusted for the digest it is compared against.
+pub fn check(tpm: &mut Tpm, token: &Tpm2Token, pcrs: &[u8], bank: Bank) -> Drift {
 	if let Some(kind) = token.advanced {
 		// Not a literal-PCR policy, so a PCR trial session computes a digest
 		// that was never meant to match.
 		return Drift::Unknown(format!("the enrollment uses {kind}"));
 	}
 
-	if token.pcrs.is_empty() {
+	if pcrs.is_empty() {
 		// Sealed against nothing, so nothing can drift. Whatever went wrong,
 		// re-enrolling against no PCRs would reproduce it exactly.
 		return Drift::Matches;
 	}
 
-	let bank = match &token.bank {
-		Some(name) => match Bank::from_name(name) {
-			Some(b) => b,
-			None => return Drift::Unknown(format!("unrecognised PCR bank {name:?}")),
-		},
-		// systemd omits the field only for enrollments old enough to predate
-		// bank selection, which assumed sha256.
-		None => Bank::SHA256,
-	};
-
-	let current = match tpm.pcr_policy_digest(bank, &token.pcrs, token.pin) {
+	let current = match tpm.pcr_policy_digest(bank, pcrs, token.pin) {
 		Ok(d) => d,
 		Err(e) => return Drift::Unknown(e),
 	};
@@ -114,13 +105,11 @@ mod tests {
 	fn an_empty_pcr_set_cannot_have_drifted() {
 		// An enrollment over no PCRs unlocks unconditionally, so its failure is
 		// always something else.
-		let mut t = token();
-		t.pcrs = vec![];
-		let actual = check_without_tpm(&t);
+		let actual = check_without_tpm(&token(), &[]);
 		assert_eq!(
 			actual,
 			Some(Drift::Matches),
-			"check(<token sealed against no PCRs>) returned {actual:?}, expected Some(Matches)"
+			"check(<token>, pcrs = []) returned {actual:?}, expected Some(Matches)"
 		);
 	}
 
@@ -130,40 +119,24 @@ mod tests {
 		// drift would wipe a working token this tool cannot recreate.
 		let mut t = token();
 		t.advanced = Some("a signed PCR policy");
-		let actual = check_without_tpm(&t);
+		let actual = check_without_tpm(&t, &[7]);
 		assert!(
 			matches!(actual, Some(Drift::Unknown(_))),
-			"check(<signed policy token>) returned {actual:?}, expected Some(Unknown(_))"
-		);
-	}
-
-	#[test]
-	fn an_unknown_bank_is_unknown() {
-		let mut t = token();
-		t.bank = Some("sha3-256".to_string());
-		let actual = check_without_tpm(&t);
-		assert!(
-			matches!(actual, Some(Drift::Unknown(_))),
-			"check(<token in an unrecognised bank>) returned {actual:?}, expected Some(Unknown(_))"
+			"check(<signed policy token>, pcrs = [7]) returned {actual:?}, expected Some(Unknown(_))"
 		);
 	}
 
 	/// The part of `check` that runs before the TPM is consulted. `None` means
 	/// the real function would have gone on to ask the hardware, which the VM
 	/// test covers instead.
-	fn check_without_tpm(token: &Tpm2Token) -> Option<Drift> {
+	fn check_without_tpm(token: &Tpm2Token, pcrs: &[u8]) -> Option<Drift> {
 		if let Some(kind) = token.advanced {
 			return Some(Drift::Unknown(format!("the enrollment uses {kind}")));
 		}
-		if token.pcrs.is_empty() {
+		if pcrs.is_empty() {
 			return Some(Drift::Matches);
 		}
-		match &token.bank {
-			Some(name) if Bank::from_name(name).is_none() => {
-				Some(Drift::Unknown(format!("unrecognised PCR bank {name:?}")))
-			}
-			_ => None,
-		}
+		None
 	}
 
 	#[test]

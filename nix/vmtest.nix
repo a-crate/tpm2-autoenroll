@@ -17,6 +17,8 @@
 #      systemd-cryptsetup, which would spend the one attempt we get (2.3).
 #   4. A second volume sharing the passphrase is answered from the daemon's
 #      cache without a second prompt (section 5).
+#   5. A header whose PCR selection disagrees with the config is left alone
+#      without a consent prompt, since the header is not a source of policy.
 #
 # PCR 16 is the debug PCR: extendable from userspace, which lets us manufacture
 # the policy mismatch in place. No reboot and no boot loader, so the test is
@@ -64,11 +66,17 @@ pkgs.testers.runNixOSTest {
           (volume: device: "${volume} ${device} - noauto,tpm2-device=auto")
           volumes);
 
-    # No configuration file and no .socket unit: the daemon takes its volumes
-    # from the crypttab above and binds one socket per TPM2-bound entry itself,
-    # including creating /run/cryptsetup-keys.d. Nothing here tells it that
-    # there are three volumes.
-    #
+    # The crypttab drives systemd-cryptsetup; this drives the daemon, which
+    # binds one socket per volume itself, including creating
+    # /run/cryptsetup-keys.d.
+    environment.etc."tpm2-autoenroll/config.json".text = builtins.toJSON {
+      volumes = lib.mapAttrs (_: device: {
+        inherit device;
+        pcrs = [ 16 ];
+      }) volumes;
+    };
+
+
     # wantedBy multi-user.target rather than the module's drop-in on
     # systemd-cryptsetup@.service: this test drives the cryptsetup units by
     # hand, and what is under test is the daemon rather than the wiring.
@@ -184,13 +192,10 @@ pkgs.testers.runNixOSTest {
         return None
 
 
-    def mangle_token_blob(device):
-        """Break unsealing without touching the policy or the PCRs.
-
-        The sealed blob is what the TPM hands back a key from; replacing it with
-        something that is still valid base64 but is not a TPM object makes every
-        unseal attempt fail, while tpm2-policy-hash -- the thing the daemon
-        compares against -- stays exactly as enrolled."""
+    def rewrite_token(device, edit):
+        """Export the systemd-tpm2 token, pass it through edit(), and put it
+        back. Needs no key, which is exactly why the header cannot be trusted
+        as a source of policy."""
         import json
 
         # Not necessarily token 0: systemd-cryptenroll adds the new token before
@@ -198,23 +203,13 @@ pkgs.testers.runNixOSTest {
         index = token_index(device)
         assert index is not None, (
             f"token_index({device}) returned None, expected a systemd-tpm2 token "
-            "to mangle"
+            "to rewrite"
         )
 
         token = json.loads(
             machine.succeed(f"cryptsetup token export --token-id {index} {device}")
         )
-
-        def flatten(value):
-            # systemd writes this either as one base64 string or as an array of
-            # them (key sharding); both spellings are live.
-            core = value.rstrip("=")
-            return "A" * len(core) + value[len(core):]
-
-        blob = token["tpm2-blob"]
-        token["tpm2-blob"] = (
-            [flatten(b) for b in blob] if isinstance(blob, list) else flatten(blob)
-        )
+        edit(token)
 
         machine.succeed(f"cryptsetup token remove --token-id {index} {device}")
         machine.succeed(
@@ -223,6 +218,29 @@ pkgs.testers.runNixOSTest {
         machine.succeed(
             f"cryptsetup token import --token-id {index} --json-file /tmp/token.json {device}"
         )
+
+
+    def mangle_token_blob(device):
+        """Break unsealing without touching the policy or the PCRs.
+
+        The sealed blob is what the TPM hands back a key from; replacing it with
+        something that is still valid base64 but is not a TPM object makes every
+        unseal attempt fail, while tpm2-policy-hash -- the thing the daemon
+        compares against -- stays exactly as enrolled."""
+
+        def flatten(value):
+            # systemd writes this either as one base64 string or as an array of
+            # them (key sharding); both spellings are live.
+            core = value.rstrip("=")
+            return "A" * len(core) + value[len(core):]
+
+        def edit(token):
+            blob = token["tpm2-blob"]
+            token["tpm2-blob"] = (
+                [flatten(b) for b in blob] if isinstance(blob, list) else flatten(blob)
+            )
+
+        rewrite_token(device, edit)
 
 
     def set_token_plugin(enabled):
@@ -241,9 +259,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_file("/dev/tpmrm0")
     machine.wait_for_unit("tpm2-autoenrolld.service")
 
-    with subtest("the daemon found its volumes in the crypttab and bound their sockets"):
-        # Nothing configured the daemon: every socket here exists because the
-        # crypttab entry it is named after carries tpm2-device=.
+    with subtest("the daemon bound a socket for every configured volume"):
         mode = machine.succeed("stat -c %a /run/cryptsetup-keys.d").strip()
         assert mode == "700", (
             f"stat -c %a /run/cryptsetup-keys.d returned {mode!r}, expected "
@@ -603,9 +619,64 @@ pkgs.testers.runNixOSTest {
             "TPM2-bound has no binding to repair and must be left exactly as it is"
         )
 
-    with subtest("every volume was paired with the device the crypttab names"):
+    with subtest("a header whose selection disagrees with the config is left alone"):
+        # The evil-maid case: with offline access to the disk, rewrite the
+        # token to name a different PCR and a garbage policy hash. Unsealing
+        # fails, the daemon is reached in the plain phase, and the header's
+        # word "7" must not become the selection the volume is re-sealed to.
+        machine.succeed(f"systemctl stop {UNIT3}")
+        machine.succeed(
+            f"PASSWORD={PASSPHRASE} {CRYPTENROLL} "
+            f"--tpm2-device=auto --tpm2-pcrs=16 {DEVICE3}"
+        )
+
+        def tamper(token):
+            token["tpm2-pcrs"] = [7]
+            token["tpm2-policy-hash"] = "00" * 32
+
+        rewrite_token(DEVICE3, tamper)
+        before = header_digest(DEVICE3)
+        watch = LogWatch()
+
+        # The passphrase comes from the cache, so a prompt of any kind would
+        # leave this start hanging.
+        machine.succeed(f"systemctl start {UNIT3}")
+        machine.succeed(f"test -b /dev/mapper/{VOLUME3}")
+
+        log = watch.new()
+        assert "plain phase" in log, (
+            f"unlocking the tampered autotest3 produced:\n{log}\n"
+            "expected a 'plain phase' line: a token naming the wrong PCR must "
+            "fail to unseal and fall back to us"
+        )
+        expected = (
+            "the header's PCR selection 7 (sha256) differs from the configured 16 (sha256)"
+        )
+        assert expected in log, (
+            f"unlocking the tampered autotest3 produced:\n{log}\n"
+            f"expected a {expected!r} line"
+        )
+        assert "can be repaired" not in log, (
+            f"unlocking the tampered autotest3 produced:\n{log}\n"
+            "expected no 'can be repaired' line: a selection mismatch must stop "
+            "the preflight before the drift check"
+        )
+        pending = pending_password_requests()
+        assert pending == "", (
+            f"pending_password_requests() returned {pending!r}, expected an "
+            "empty string: a tampered header must not produce a consent prompt"
+        )
+
+        after = header_digest(DEVICE3)
+        assert before == after, (
+            f"cryptsetup luksDump {DEVICE3} digest was {before} before and "
+            f"{after} after, expected them to be equal: a tampered header must "
+            "be left exactly as the attacker wrote it"
+        )
+
+    with subtest("every volume was paired with the device the config names"):
         # The socket the connection arrived on is what identifies the volume,
-        # and the crypttab is what says which device that volume is backed by.
+        # and the config is what says which device that volume is backed by.
         # That the daemon put those two together correctly is what the rest of
         # this test has been relying on.
         log = "\n".join(daemon_log_lines())

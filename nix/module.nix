@@ -1,23 +1,19 @@
 # The NixOS module.
 #
-# There is very little for it to do, which is the point. The daemon finds its
-# volumes in /etc/crypttab at runtime, so this module never enumerates them; it
-# only has to put the daemon in the right place in the boot, for each stage the
-# user says their volumes are unlocked in:
+# Each volume is listed explicitly, with the PCR selection it is to be enrolled
+# against. That list is the daemon's only source of policy: the same fields in
+# the LUKS2 header are unauthenticated, so the header is compared against the
+# config and never trusted in its place (see src/config.rs).
+#
+# For each stage that has volumes, the module installs:
 #
 #   * a service that runs before anything is unlocked, with the three binaries
 #     the daemon shells out to on its PATH;
 #   * a drop-in on the systemd-cryptsetup@.service template, which is what
 #     starts that service and what orders it first;
-#   * the ignore list, if the user has opted any volume out.
-#
-# The drop-in is where the socket-per-volume problem goes away. A .socket unit
-# has to name its ListenStream= paths at build time, which would mean this
-# module re-deriving the volume list -- possible for boot.initrd.luks.devices,
-# not possible for a hand-written stage-2 crypttab. Since the template drop-in
-# applies to every instance without naming any of them, the daemon can bind its
-# own sockets from whatever it finds in the crypttab, and the two halves stay
-# out of each other's way.
+#   * a config listing only the volumes that stage unlocks, so each stage's
+#     daemon serves exactly the volumes whose PCR state it is in a position to
+#     capture.
 {
   config,
   lib,
@@ -28,14 +24,26 @@
 let
   cfg = config.services.tpm2-autoenroll;
 
-  inInitrd = lib.elem "initrd" cfg.stages;
-  inSystem = lib.elem "systemd" cfg.stages;
+  volumesFor = stage: lib.filterAttrs (_: v: v.stage == stage) cfg.volumes;
+  initrdVolumes = volumesFor "initrd";
+  systemVolumes = volumesFor "system";
+  inInitrd = initrdVolumes != { };
+  inSystem = systemVolumes != { };
 
-  ignorePath = "/etc/tpm2-autoenroll/ignore";
-  ignoreFile = pkgs.writeText "tpm2-autoenroll-ignore" (
-    lib.concatMapStrings (entry: entry + "\n") cfg.ignore
-  );
-  haveIgnore = cfg.ignore != [ ];
+  configPath = "/etc/tpm2-autoenroll/config.json";
+
+  # snake_case on the wire, camelCase in Nix.
+  configFile =
+    volumes:
+    pkgs.writeText "tpm2-autoenroll.json" (
+      builtins.toJSON {
+        volumes = lib.mapAttrs (_: v: {
+          inherit (v) device pcrs;
+          tpm2_device = v.tpm2Device;
+          pcr_bank = v.pcrBank;
+        }) volumes;
+      }
+    );
 
   # /run survives switch-root, and the sockets the daemon binds live there. It
   # unlinks them when it is asked to stop, so being stopped at switch-root is
@@ -75,20 +83,20 @@ let
     serviceConfig = {
       # Type=notify is load-bearing rather than decorative. Under Type=exec
       # systemd would call the service started as soon as the binary was
-      # executed, which is before it has read the crypttab or bound anything, so
+      # executed, which is before it has read its config or bound anything, so
       # the After= in the drop-in below would order the unlock against nothing
       # useful. The daemon notifies once every socket is listening.
       Type = "notify";
       NotifyAccess = "main";
-      ExecStart = lib.getExe cfg.package;
+      ExecStart = "${lib.getExe cfg.package} --config=${configPath}";
     };
   };
 
-  # Applies to every systemd-cryptsetup@<volume>.service the generator produces,
-  # without this module having to know what any of them are called. Wants=
-  # rather than Requires= so a daemon that fails to start costs the feature and
-  # not the boot: After= is satisfied by a failed start as well as a successful
-  # one, and the volume then unlocks exactly as it would with us uninstalled.
+  # Applies to every systemd-cryptsetup@<volume>.service the generator produces.
+  # Wants= rather than Requires= so a daemon that fails to start costs the
+  # feature and not the boot: After= is satisfied by a failed start as well as a
+  # successful one, and the volume then unlocks exactly as it would with us
+  # uninstalled.
   cryptsetupDropin = {
     overrideStrategy = "asDropin";
     text = ''
@@ -96,6 +104,69 @@ let
       Wants=tpm2-autoenrolld.service
       After=tpm2-autoenrolld.service
     '';
+  };
+
+  volumeType = lib.types.submodule {
+    options = {
+      device = lib.mkOption {
+        type = lib.types.strMatching "/.+";
+        example = "/dev/disk/by-uuid/00000000-0000-0000-0000-000000000000";
+        description = ''
+          The backing block device: what holds the LUKS2 header, not the
+          `/dev/mapper` node.
+        '';
+      };
+
+      tpm2Device = lib.mkOption {
+        type = lib.types.either (lib.types.enum [ "auto" ]) (lib.types.strMatching "/.+");
+        default = "auto";
+        description = ''
+          `--tpm2-device=` for enrollment, and the device the daemon reads PCRs
+          and lockout state from. "auto" means `/dev/tpmrm0`.
+        '';
+      };
+
+      pcrs = lib.mkOption {
+        type = lib.types.listOf (lib.types.ints.between 0 23);
+        example = [
+          0
+          1
+          7
+        ];
+        description = ''
+          The PCR selection to enroll against. The daemon refuses to touch a
+          volume whose header names a different selection.
+        '';
+      };
+
+      pcrBank = lib.mkOption {
+        type = lib.types.enum [
+          "sha1"
+          "sha256"
+          "sha384"
+          "sha512"
+        ];
+        default = "sha256";
+        description = ''
+          The PCR bank to enroll against. A header naming a different bank is
+          refused, as with {option}`pcrs`.
+        '';
+      };
+
+      stage = lib.mkOption {
+        type = lib.types.enum [
+          "initrd"
+          "system"
+        ];
+        default = "initrd";
+        description = ''
+          Which stage this volume is unlocked in. The daemon has to run in that
+          stage, because the PCR values read when it is consulted are the ones
+          that will be present the next time the volume is unlocked at that same
+          point in boot.
+        '';
+      };
+    };
   };
 in
 {
@@ -118,44 +189,26 @@ in
       '';
     };
 
-    stages = lib.mkOption {
-      type = lib.types.listOf (
-        lib.types.enum [
-          "initrd"
-          "systemd"
-        ]
-      );
-      default = [ "initrd" ];
-      example = [
-        "systemd"
-        "initrd"
-      ];
-      description = ''
-        Which boot stages to run the daemon in: `initrd` for volumes unlocked
-        by the systemd initrd, `systemd` for those unlocked by the booted
-        system. In each one it manages the TPM2-bound volumes of that stage's
-        own `/etc/crypttab`, so listing a stage with no such volumes is
-        harmless.
-
-        This is per stage rather than per volume because the design's invariant
-        is to enroll at the point of unlock: the PCR values read when the
-        daemon is consulted are the ones that will be present the next time
-        that volume is unlocked at that same point in boot.
+    volumes = lib.mkOption {
+      type = lib.types.attrsOf volumeType;
+      default = { };
+      example = lib.literalExpression ''
+        {
+          root = {
+            device = "/dev/disk/by-uuid/...";
+            pcrs = [ 0 1 7 ];
+          };
+          backup = {
+            device = "/dev/disk/by-uuid/...";
+            pcrs = [ 7 ];
+            stage = "system";
+          };
+        }
       '';
-    };
-
-    ignore = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      example = [ "swap" ];
       description = ''
-        Volumes that must never be re-enrolled, and never prompt. An entry
-        matches either the volume (mapper) name or the backing device, and
-        device specs are resolved the way crypttab resolves them, so
-        `UUID=...` means here what it means there.
-
-        Everything else that is TPM2-bound in the crypttab is managed; there is
-        no list to add a volume to.
+        The volumes the daemon may act on, keyed by volume (mapper) name. The
+        name has to match the crypttab entry: it is what the daemon's socket
+        is named after and what systemd-cryptsetup identifies itself with.
       '';
     };
   };
@@ -163,17 +216,16 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.stages != [ ];
+        assertion = cfg.volumes != { };
         message = ''
-          services.tpm2-autoenroll is enabled with no stages, so nothing is
-          installed anywhere. Set services.tpm2-autoenroll.stages to the stages
-          your TPM2-bound volumes are unlocked in.
+          services.tpm2-autoenroll is enabled with no volumes, so nothing is
+          installed anywhere. List them in services.tpm2-autoenroll.volumes.
         '';
       }
       {
         assertion = !inInitrd || config.boot.initrd.systemd.enable;
         message = ''
-          services.tpm2-autoenroll has "initrd" in its stages, which requires
+          services.tpm2-autoenroll has initrd volumes, which requires
           boot.initrd.systemd.enable. The whole mechanism is
           systemd-cryptsetup's key-discovery path; the scripted initrd does not
           have one.
@@ -182,20 +234,62 @@ in
       {
         assertion = !inInitrd || config.boot.initrd.systemd.tpm2.enable;
         message = ''
-          services.tpm2-autoenroll has "initrd" in its stages, which requires
+          services.tpm2-autoenroll has initrd volumes, which requires
           boot.initrd.systemd.tpm2.enable so that /dev/tpmrm0 exists by the time
           systemd-cryptsetup runs. Without it there is no TPM2 unlock to fall
           back from and nothing to re-enroll.
         '';
       }
-    ];
+    ]
+    ++ lib.mapAttrsToList (name: v: {
+      assertion = v.pcrs != [ ];
+      message = ''
+        services.tpm2-autoenroll.volumes.${name}.pcrs is empty. A policy over no
+        PCRs unseals unconditionally.
+      '';
+    }) cfg.volumes
+    ++ lib.concatLists (
+      lib.mapAttrsToList (
+        name: _:
+        let
+          luks = config.boot.initrd.luks.devices.${name} or null;
+        in
+        [
+          {
+            assertion = luks != null;
+            message = ''
+              services.tpm2-autoenroll.volumes.${name} is an initrd volume, but
+              there is no boot.initrd.luks.devices.${name}. The attribute name is
+              the volume (mapper) name and has to match.
+            '';
+          }
+          {
+            assertion = luks == null || luks.keyFile == null;
+            message = ''
+              services.tpm2-autoenroll.volumes.${name} cannot be managed while
+              boot.initrd.luks.devices.${name}.keyFile is set: with a key file,
+              systemd-cryptsetup never searches for a discovered key, so it
+              never contacts the daemon.
+            '';
+          }
+          {
+            assertion = luks == null || lib.any (lib.hasPrefix "tpm2-device=") luks.crypttabExtraOpts;
+            message = ''
+              services.tpm2-autoenroll.volumes.${name} is not TPM2-bound:
+              boot.initrd.luks.devices.${name}.crypttabExtraOpts has no
+              tpm2-device= entry, so there is no TPM2 unlock to fall back from.
+            '';
+          }
+        ]
+      ) initrdVolumes
+    );
 
     boot.initrd.systemd = lib.mkIf inInitrd (
       let
         systemdPackage = config.boot.initrd.systemd.package;
       in
       {
-        contents = lib.mkIf haveIgnore { ${ignorePath}.source = ignoreFile; };
+        contents.${configPath}.source = configFile initrdVolumes;
 
         # One binary at a time rather than whole packages: the initrd builder
         # copies the closure of each path it is given, so naming the three
@@ -214,8 +308,8 @@ in
       }
     );
 
-    environment.etc = lib.mkIf (inSystem && haveIgnore) {
-      ${lib.removePrefix "/etc/" ignorePath}.source = ignoreFile;
+    environment.etc = lib.mkIf inSystem {
+      ${lib.removePrefix "/etc/" configPath}.source = configFile systemVolumes;
     };
 
     systemd.services.tpm2-autoenrolld = lib.mkIf inSystem (serviceUnit false config.systemd.package);

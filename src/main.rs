@@ -21,11 +21,10 @@
 mod askpw;
 mod bindname;
 mod cache;
+mod config;
 mod consent;
-mod crypttab;
 mod drift;
 mod enroll;
-mod ignore;
 mod log;
 mod luks;
 mod memfd;
@@ -46,7 +45,7 @@ use rustix::net::{SocketAddrAny, SocketAddrUnix};
 use crate::askpw::Attempt;
 use crate::bindname::Phase;
 use crate::cache::Cache;
-use crate::crypttab::Volume;
+use crate::config::Volume;
 use crate::drift::Drift;
 use crate::log::{error, info, notice, warning};
 use crate::luks::Verdict;
@@ -66,10 +65,9 @@ struct Listener {
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
 /// Every path defaults to what a NixOS system uses; the overrides exist so the
-/// daemon can be driven by hand without a machine's real crypttab involved.
+/// daemon can be driven by hand.
 struct Args {
-	crypttab: String,
-	ignore: String,
+	config: String,
 	socket_dir: String,
 }
 
@@ -86,7 +84,9 @@ fn main() -> std::process::ExitCode {
 	lock_memory();
 	catch_sigterm();
 
-	let volumes = match discover(&args) {
+	// No config means no sockets, and no sockets means stock behaviour: the
+	// Wants= drop-in lets the boot go on without us.
+	let volumes = match config::load(&args.config) {
 		Ok(v) => v,
 		Err(e) => {
 			error!("{e}");
@@ -95,9 +95,7 @@ fn main() -> std::process::ExitCode {
 	};
 
 	if volumes.is_empty() {
-		// Not a failure: a machine with no TPM2-bound volume in this stage has
-		// nothing for us to do.
-		notice!("{}: no TPM2-bound volumes to serve", args.crypttab);
+		notice!("{}: no usable volumes to serve", args.config);
 		notify::ready();
 		return std::process::ExitCode::SUCCESS;
 	}
@@ -130,15 +128,19 @@ fn main() -> std::process::ExitCode {
 /// `None` when the invocation only printed something and should exit.
 fn parse_args() -> Result<Option<Args>, String> {
 	let mut args = Args {
-		crypttab: crypttab::DEFAULT_PATH.to_string(),
-		ignore: ignore::DEFAULT_PATH.to_string(),
+		config: config::DEFAULT_PATH.to_string(),
 		socket_dir: sockets::DEFAULT_DIR.to_string(),
 	};
 
 	for arg in std::env::args().skip(1) {
 		if arg == "--version" {
 			let mut out = std::io::stdout();
-			let _ = writeln!(out, "{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+			let _ = writeln!(
+				out,
+				"{} {}",
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION")
+			);
 			return Ok(None);
 		}
 
@@ -149,52 +151,13 @@ fn parse_args() -> Result<Option<Args>, String> {
 			return Err(format!("{name}= needs a path"));
 		}
 		match name {
-			"--crypttab" => args.crypttab = value.to_string(),
-			"--ignore" => args.ignore = value.to_string(),
+			"--config" => args.config = value.to_string(),
 			"--socket-dir" => args.socket_dir = value.to_string(),
 			_ => return Err(format!("unrecognised argument {arg:?}")),
 		}
 	}
 
 	Ok(Some(args))
-}
-
-/// Which volumes this run will manage: the TPM2-bound entries of the crypttab,
-/// less the ones the user has opted out.
-fn discover(args: &Args) -> Result<Vec<Volume>, String> {
-	let volumes = match crypttab::load(&args.crypttab) {
-		Ok(v) => v,
-		// A stage with no crypttab has no encrypted volumes in it.
-		Err(e) if missing(&args.crypttab) => {
-			notice!("{e}; nothing to serve");
-			return Ok(Vec::new());
-		}
-		Err(e) => return Err(e),
-	};
-
-	let ignored = ignore::load(&args.ignore)?;
-	if ignored.is_empty() {
-		return Ok(volumes);
-	}
-
-	Ok(volumes
-		.into_iter()
-		.filter(|v| {
-			let keep = !ignored.covers(v);
-			if !keep {
-				notice!(
-					"volume {:?} is listed in {}; it will never be re-enrolled",
-					v.name,
-					args.ignore
-				);
-			}
-			keep
-		})
-		.collect())
-}
-
-fn missing(path: &str) -> bool {
-	!std::path::Path::new(path).exists()
 }
 
 /// Bind one socket per volume.
@@ -448,7 +411,7 @@ fn maybe_reenroll(
 			drift::short(&plan.state)
 		);
 	}
-	preflight::log_state(volume, &mut tpm, &plan);
+	preflight::log_state(volume, &mut tpm, config);
 
 	// A decision carries across volumes sharing a boot state, so five volumes
 	// bound to the same drifted PCRs ask once.
@@ -460,33 +423,37 @@ fn maybe_reenroll(
 	}
 
 	if !decided.accepted(&plan.state) {
-	    match consent::ask(volume, &config.device) {
-	        consent::Answer::No => {
-			    notice!("volume {volume:?}: leaving the header alone: re-enrollment was declined");
-			    if !plan.state.is_empty() {
-			        decided.decline(&plan.state);
-			    }
-			    return;
-		    }
-		    consent::Answer::Always => {
-		        notice!("volume {volume:?}: automatically re-enrolling this PCR set for future volumes");
-			    decided.accept(&plan.state);
-		    }
-		    _ => {}
-	    }
+		match consent::ask(volume, &config.device, &config.pcrs, config.bank) {
+			consent::Answer::No => {
+				notice!("volume {volume:?}: leaving the header alone: re-enrollment was declined");
+				if !plan.state.is_empty() {
+					decided.decline(&plan.state);
+				}
+				return;
+			}
+			consent::Answer::Always => {
+				notice!(
+					"volume {volume:?}: automatically re-enrolling this PCR set for future volumes"
+				);
+				decided.accept(&plan.state);
+			}
+			consent::Answer::Yes => {}
+		}
 	}
 
 	if let Err(e) = enroll::run(
 		&config.device,
 		&config.tpm2_device,
-		&plan.pcrs,
-		plan.bank.as_deref(),
+		&config.pcrs,
+		config.bank,
 		secret,
 	) {
 		// systemd-cryptenroll adds the new slot before wiping the old one and
 		// never wipes the slot it just added, so a failure leaves the old
 		// binding, the new one, or both -- and the passphrase either way.
-		error!("volume {volume:?}: re-enrollment failed ({e}); the volume still unlocks by passphrase");
+		error!(
+			"volume {volume:?}: re-enrollment failed ({e}); the volume still unlocks by passphrase"
+		);
 		return;
 	}
 
@@ -516,7 +483,10 @@ fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2:
 	// TPM2 unseal and nothing else.
 	match enroll::test_unseal(&config.device, new.index) {
 		Ok(()) => {
-			notice!("volume {volume:?}: re-enrolled as token {} and verified by unsealing it", new.index);
+			notice!(
+				"volume {volume:?}: re-enrolled as token {} and verified by unsealing it",
+				new.index
+			);
 			return;
 		}
 		Err(e) => info!(
@@ -530,7 +500,7 @@ fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2:
 	// policy against the current PCRs is weaker -- it would not notice an
 	// unusable SRK -- but it covers the failure this tool can cause, which is
 	// sealing against the wrong state.
-	match drift::check(tpm, new) {
+	match drift::check(tpm, new, &config.pcrs, config.bank) {
 		Drift::Matches => notice!(
 			"volume {volume:?}: re-enrolled as token {}, and its policy matches the current PCRs",
 			new.index

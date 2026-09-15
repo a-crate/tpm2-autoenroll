@@ -13,18 +13,25 @@ use std::process::{Command, Stdio};
 use crate::memfd::SecretFile;
 use crate::secret::Secret;
 use crate::token::Tpm2Token;
+use crate::tpm2::Bank;
 
 const BINARY: &str = "systemd-cryptenroll";
 
-/// Re-bind `device` to the PCR state it is in right now. `pcrs` and `bank` are
-/// already decided by the preflight.
+/// Re-bind `device` to the PCR state it is in right now. `pcrs` and `bank` come
+/// from the config.
 pub fn run(
 	device: &str,
 	tpm2_device: &str,
 	pcrs: &[u8],
-	bank: Option<&str>,
+	bank: Bank,
 	secret: &Secret,
 ) -> Result<(), String> {
+	// Config validation already refuses this. Checked again because the result
+	// would be a token that unseals unconditionally.
+	if pcrs.is_empty() {
+		return Err("refusing to enroll against an empty PCR selection".to_string());
+	}
+
 	// Never argv, never the environment. $PASSWORD does work
 	// (src/cryptenroll/cryptenroll-password.c:30) but is undocumented and leaves
 	// the secret readable in /proc for the process's lifetime.
@@ -34,7 +41,7 @@ pub fn run(
 	cmd.arg(format!("--unlock-key-file={}", key.path()))
 		.arg("--wipe-slot=tpm2")
 		.arg(format!("--tpm2-device={tpm2_device}"))
-		.arg(format!("--tpm2-pcrs={}", pcr_spec(pcrs, bank)))
+		.arg(format!("--tpm2-pcrs={}", pcr_spec(pcrs, bank.name())))
 		.arg(device)
 		.stdin(Stdio::null())
 		.stdout(Stdio::null())
@@ -47,26 +54,25 @@ pub fn run(
 
 	if !out.status.success() {
 		let stderr = String::from_utf8_lossy(&out.stderr);
-		return Err(format!("{BINARY} exited with {} ({})", out.status, stderr.trim()));
+		return Err(format!(
+			"{BINARY} exited with {} ({})",
+			out.status,
+			stderr.trim()
+		));
 	}
 
 	Ok(())
 }
 
-/// The `--tpm2-pcrs=` argument: `PCR[:BANK][+PCR[:BANK]...]`.
+/// The `--tpm2-pcrs=` argument: `PCR:BANK[+PCR:BANK...]`.
 ///
-/// The bank is pinned when the old token named one, so a repair reproduces the
-/// enrollment it replaces rather than moving it to whatever systemd would pick
-/// by default today.
-fn pcr_spec(pcrs: &[u8], bank: Option<&str>) -> String {
-	let mut parts = Vec::with_capacity(pcrs.len());
-	for pcr in pcrs {
-		match bank {
-			Some(b) => parts.push(format!("{pcr}:{b}")),
-			None => parts.push(pcr.to_string()),
-		}
-	}
-	parts.join("+")
+/// The bank is always pinned, so the enrollment uses the configured one rather
+/// than whatever systemd would pick by default today.
+fn pcr_spec(pcrs: &[u8], bank: &str) -> String {
+	pcrs.iter()
+		.map(|pcr| format!("{pcr}:{bank}"))
+		.collect::<Vec<_>>()
+		.join("+")
 }
 
 /// Does the freshly written token actually unlock the volume?
@@ -132,11 +138,10 @@ mod tests {
 
 	#[test]
 	fn builds_the_pcr_spec_systemd_documents() {
-		let cases: [(&[u8], Option<&str>, &str); 4] = [
-			(&[7], Some("sha256"), "7:sha256"),
-			(&[7, 11], Some("sha256"), "7:sha256+11:sha256"),
-			(&[7, 11], None, "7+11"),
-			(&[16], None, "16"),
+		let cases: [(&[u8], &str, &str); 3] = [
+			(&[7], "sha256", "7:sha256"),
+			(&[7, 11], "sha256", "7:sha256+11:sha256"),
+			(&[16], "sha384", "16:sha384"),
 		];
 		for (pcrs, bank, expected) in cases {
 			let actual = pcr_spec(pcrs, bank);
@@ -148,14 +153,13 @@ mod tests {
 	}
 
 	#[test]
-	fn an_empty_selection_produces_an_empty_spec() {
-		// The caller must never get here -- enrolling against no PCRs would
-		// produce a token that unlocks unconditionally -- so this records the
-		// shape rather than endorsing it.
-		let actual = pcr_spec(&[], Some("sha256"));
-		assert_eq!(
-			actual, "",
-			"pcr_spec([], Some(\"sha256\")) returned {actual:?}, expected \"\""
+	fn refuses_an_empty_selection() {
+		// Checked before anything is spawned, so no device or TPM is needed.
+		let secret = Secret::new(b"unused".to_vec());
+		let actual = run("/nonexistent", "auto", &[], Bank::SHA256, &secret);
+		assert!(
+			actual.is_err(),
+			"run(\"/nonexistent\", \"auto\", [], SHA256, _) returned {actual:?}, expected Err"
 		);
 	}
 

@@ -9,11 +9,12 @@
 //! | a TPM2 device answers | wiping the token when there is no TPM is pure loss |
 //! | it is not in dictionary-attack lockout | sealing succeeds, unsealing keeps failing, and we rewrite the header every boot |
 //! | exactly one systemd-tpm2 token | `--wipe-slot=tpm2` removes all of them; with two, one is someone else's working binding |
+//! | the header's selection and bank match the config | the header is unauthenticated; a mismatch is a manual re-enrollment or tampering |
 //! | the enrollment is a plain PCR policy | a signed or pcrlock policy is one we cannot recreate, so replacing it is a downgrade |
-//! | the volume has a token at all | nothing to repair, and no PCR selection to infer one from |
+//! | the volume has a token at all | nothing to repair |
 //! | the PCRs actually drifted | if they match, re-sealing changes nothing and the next boot fails identically |
 
-use crate::crypttab::Volume;
+use crate::config::{self, Volume};
 use crate::drift::{self, Drift};
 use crate::log::{error, info};
 use crate::token::{self, Tpm2Token};
@@ -29,14 +30,13 @@ pub enum Decision {
 	Leave(String),
 }
 
-/// Everything the enrollment step needs, settled before anything is written.
+/// Everything the enrollment step needs beyond the volume's own config, settled
+/// before anything is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
 	pub old_token: Option<u32>,
-	pub pcrs: Vec<u8>,
-	pub bank: Option<String>,
-	/// What the volume is sealed against now, empty when there is no enrollment
-	/// to replace. Logged rather than used, so the event is auditable.
+	/// What the volume is sealed against now. Logged rather than used, so the
+	/// event is auditable.
 	pub enrolled: Vec<u8>,
 	/// The policy digest the current PCRs produce. Doubles as the consent
 	/// cache's key, since it identifies this boot state exactly.
@@ -72,19 +72,15 @@ pub fn check(volume: &str, config: &Volume, tpm: &mut Tpm) -> Decision {
 
 	match tokens.len() {
 		0 => absent(),
-		1 => drifted(&tokens[0], tpm),
+		1 => drifted(&tokens[0], config, tpm),
 		n => Decision::Leave(format!(
 			"the header carries {n} systemd-tpm2 tokens, and --wipe-slot=tpm2 would remove all of them"
 		)),
 	}
 }
 
-/// The "never enrolled" case, which is not a repair.
-///
-/// The PCR selection a volume should be bound to is read out of the token being
-/// replaced, so a volume with no token supplies nothing to bind against, and
-/// guessing one on a fallback path would invent a policy the user never chose.
-/// `systemd-cryptenroll` is the tool for a first enrollment.
+/// The "never enrolled" case, which is not a repair. `systemd-cryptenroll` is
+/// the tool for a first enrollment.
 fn absent() -> Decision {
 	Decision::Leave(
 		"it carries no systemd-tpm2 token, so there is no TPM2 binding to repair".to_string(),
@@ -92,15 +88,15 @@ fn absent() -> Decision {
 }
 
 /// The ordinary case: one token, and the question is whether it has gone stale.
-fn drifted(token: &Tpm2Token, tpm: &mut Tpm) -> Decision {
-	match drift::check(tpm, token) {
+fn drifted(token: &Tpm2Token, config: &Volume, tpm: &mut Tpm) -> Decision {
+	if let Err(why) = same_selection(token, config) {
+		return Decision::Leave(why);
+	}
+
+	match drift::check(tpm, token, &config.pcrs, config.bank) {
 		Drift::Drifted { current, .. } => Decision::Reenroll(Plan {
 			old_token: Some(token.index),
-			// Narrowing or widening what the volume is bound to is a policy
-			// change, not one to make silently on a fallback path.
-			pcrs: token.pcrs.clone(),
 			enrolled: token.policy_hash.clone(),
-			bank: token.bank.clone(),
 			state: current,
 		}),
 		Drift::Matches => Decision::Leave(
@@ -108,20 +104,43 @@ fn drifted(token: &Tpm2Token, tpm: &mut Tpm) -> Decision {
 			 some other reason and re-sealing would change nothing"
 				.to_string(),
 		),
-		Drift::Unknown(why) => Decision::Leave(format!("cannot tell whether the PCRs drifted: {why}")),
+		Drift::Unknown(why) => {
+			Decision::Leave(format!("cannot tell whether the PCRs drifted: {why}"))
+		}
 	}
+}
+
+/// Does the header's selection agree with the config?
+///
+/// The header is not a source of policy, but a disagreement is still worth
+/// refusing over rather than silently overriding: either someone re-enrolled
+/// by hand against a selection the config does not know about, or the header
+/// has been rewritten offline to get the next repair sealed somewhere weaker.
+fn same_selection(token: &Tpm2Token, config: &Volume) -> Result<(), String> {
+	// systemd omits the bank only for enrollments old enough to predate bank
+	// selection, which assumed sha256.
+	let header_bank = token.bank.as_deref().unwrap_or("sha256");
+	if token.pcrs == config.pcrs && header_bank == config.bank.name() {
+		return Ok(());
+	}
+
+	let header_pcrs = if token.pcrs.is_empty() {
+		"(none)".to_string()
+	} else {
+		config::pcr_list(&token.pcrs)
+	};
+	Err(format!(
+		"the header's PCR selection {header_pcrs} ({header_bank}) differs from the configured {} ({}); \
+		 refusing: this is a manual re-enrollment or tampering",
+		config::pcr_list(&config.pcrs),
+		config.bank.name()
+	))
 }
 
 /// What was measured at the moment we were consulted, which is what the new
 /// policy will be sealed against.
-pub fn log_state(volume: &str, tpm: &mut Tpm, plan: &Plan) {
-	let bank = plan
-		.bank
-		.as_deref()
-		.and_then(crate::tpm2::Bank::from_name)
-		.unwrap_or(crate::tpm2::Bank::SHA256);
-
-	match tpm.read_pcrs(bank, &plan.pcrs) {
+pub fn log_state(volume: &str, tpm: &mut Tpm, config: &Volume) {
+	match tpm.read_pcrs(config.bank, &config.pcrs) {
 		Ok(values) => {
 			for (pcr, digest) in values {
 				let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -135,6 +154,28 @@ pub fn log_state(volume: &str, tpm: &mut Tpm, plan: &Plan) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::tpm2::Bank;
+
+	fn config(pcrs: &[u8], bank: &str) -> Volume {
+		Volume {
+			name: "root".to_string(),
+			device: "/dev/vda2".to_string(),
+			tpm2_device: "auto".to_string(),
+			pcrs: pcrs.to_vec(),
+			bank: Bank::from_name(bank).unwrap(),
+		}
+	}
+
+	fn token(pcrs: &[u8], bank: Option<&str>) -> Tpm2Token {
+		Tpm2Token {
+			index: 0,
+			pcrs: pcrs.to_vec(),
+			bank: bank.map(str::to_string),
+			policy_hash: vec![0xaa; 32],
+			pin: false,
+			advanced: None,
+		}
+	}
 
 	#[test]
 	fn an_unenrolled_volume_is_left_alone() {
@@ -147,34 +188,50 @@ mod tests {
 	}
 
 	#[test]
-	fn a_repair_keeps_the_selection_it_repairs() {
-		// The PCR selection lives in the token and nowhere else, so a repair
-		// must not move the volume to a different set of registers.
-		let token = Tpm2Token {
-			index: 2,
-			pcrs: vec![7, 11],
-			bank: Some("sha384".to_string()),
-			policy_hash: vec![0xaa; 32],
-			pin: false,
-			advanced: None,
-		};
-		let plan = Plan {
-			old_token: Some(2),
-			pcrs: token.pcrs.clone(),
-			enrolled: token.policy_hash.clone(),
-			bank: token.bank.clone(),
-			state: vec![0xbb; 32],
-		};
+	fn a_matching_selection_passes() {
+		let cases = [
+			(token(&[0, 1, 7], Some("sha256")), "explicit bank"),
+			(token(&[0, 1, 7], None), "absent bank means sha256"),
+		];
+		let cfg = config(&[0, 1, 7], "sha256");
+		for (t, why) in cases {
+			let actual = same_selection(&t, &cfg);
+			assert_eq!(
+				actual,
+				Ok(()),
+				"same_selection({t:?}, <0+1+7 sha256>) returned {actual:?}, expected Ok(()) ({why})"
+			);
+		}
+	}
 
-		assert_eq!(
-			plan.pcrs, token.pcrs,
-			"a repair plan for a token over {:?} used {:?}, expected the token's own selection",
-			token.pcrs, plan.pcrs
-		);
-		assert_eq!(
-			plan.bank, token.bank,
-			"a repair plan for a token in bank {:?} used {:?}, expected the token's own bank",
-			token.bank, plan.bank
+	#[test]
+	fn a_differing_selection_is_refused() {
+		// The evil-maid case: the header was rewritten to name a register every
+		// boot resets, or a weaker bank.
+		let cases = [
+			(token(&[16], Some("sha256")), "PCR 16 instead of 0+1+7"),
+			(token(&[0, 1], Some("sha256")), "a narrower selection"),
+			(token(&[0, 1, 7, 16], Some("sha256")), "a wider selection"),
+			(token(&[], Some("sha256")), "no PCRs at all"),
+			(token(&[0, 1, 7], Some("sha1")), "a downgraded bank"),
+		];
+		let cfg = config(&[0, 1, 7], "sha256");
+		for (t, why) in cases {
+			let actual = same_selection(&t, &cfg);
+			assert!(
+				actual.is_err(),
+				"same_selection({t:?}, <0+1+7 sha256>) returned {actual:?}, expected Err ({why})"
+			);
+		}
+	}
+
+	#[test]
+	fn a_refusal_names_both_selections() {
+		let t = token(&[16], None);
+		let actual = same_selection(&t, &config(&[0, 1, 7], "sha256")).unwrap_err();
+		assert!(
+			actual.contains("selection 16 (sha256)") && actual.contains("configured 0+1+7 (sha256)"),
+			"same_selection(<16>, <0+1+7 sha256>) returned Err({actual:?}), expected it to name both selections"
 		);
 	}
 }

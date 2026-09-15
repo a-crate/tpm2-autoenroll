@@ -57,6 +57,16 @@ impl Bank {
 			_ => None,
 		}
 	}
+
+	pub fn name(self) -> &'static str {
+		match self.0 {
+			0x0004 => "sha1",
+			0x000b => "sha256",
+			0x000c => "sha384",
+			0x000d => "sha512",
+			_ => "unknown",
+		}
+	}
 }
 
 /// What the TPM says about its dictionary-attack state.
@@ -265,7 +275,10 @@ fn command(cc: u32, body: &[u8]) -> Vec<u8> {
 /// Check a response header and return everything after it.
 fn response_payload(buf: &[u8]) -> Result<Vec<u8>, String> {
 	if buf.len() < 10 {
-		return Err(format!("response is {} bytes, expected at least 10", buf.len()));
+		return Err(format!(
+			"response is {} bytes, expected at least 10",
+			buf.len()
+		));
 	}
 
 	let size = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]) as usize;
