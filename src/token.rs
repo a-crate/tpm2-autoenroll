@@ -16,6 +16,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::child;
+use crate::device::Device;
 
 const BINARY: &str = "cryptsetup";
 
@@ -65,20 +66,22 @@ const KNOWN_KEYS: &[&str] = &[
 ];
 
 /// Every `systemd-tpm2` token in `device`'s header, in header order.
-pub fn read(device: &str) -> Result<Vec<Tpm2Token>, String> {
+pub fn read(device: &Device) -> Result<Vec<Tpm2Token>, String> {
 	let mut cmd = Command::new(BINARY);
 	cmd.arg("luksDump")
 		.arg("--dump-json-metadata")
-		.arg(device)
+		.arg(device.path())
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped());
+	device.attach(&mut cmd);
 	let out = child::run(&mut cmd, TIMEOUT, MAX_JSON)?;
 
 	if !out.status.success() {
 		let stderr = String::from_utf8_lossy(&out.stderr);
 		return Err(format!(
-			"{BINARY} luksDump {device} exited with {} ({})",
+			"{BINARY} luksDump {} exited with {} ({})",
+			device.name,
 			out.status,
 			stderr.trim()
 		));

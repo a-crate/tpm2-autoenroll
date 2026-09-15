@@ -53,6 +53,7 @@ The daemon exits once every configured volume is open (`dm.rs`) or has been answ
 - **Preflight refuses unless every check passes.** It does not act unless something looks wrong.
 - **The header is never a source of policy.** Anything enrolled with (PCRs, bank) comes from the config; the header's values are compared, not used.
 - **Consent is mandatory** and never persisted across boots or made configurable. See the `consent.rs` header for the evil-maid reasoning.
+- **The device is resolved once.** `serve_passphrase` opens the configured path once (`device.rs`) and every subprocess gets `/proc/self/fd/N` for that descriptor, so a `/dev/disk/by-*` symlink changing mid-flow cannot split validation and enrollment across disks. Prompts still show the configured path.
 - **Key material** lives only in `secret::Secret` (zeroized, never printed by `Debug`). It reaches child processes through a memfd (`memfd.rs`), never through argv or the environment.
 
 ### Initrd constraints

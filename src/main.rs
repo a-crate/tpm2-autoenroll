@@ -31,6 +31,7 @@ mod cache;
 mod child;
 mod config;
 mod consent;
+mod device;
 mod dm;
 mod drift;
 mod enroll;
@@ -59,6 +60,7 @@ use crate::askpw::Attempt;
 use crate::bindname::Phase;
 use crate::cache::Cache;
 use crate::config::Volume;
+use crate::device::Device;
 use crate::drift::Drift;
 use crate::log::{error, info, notice, warning};
 use crate::luks::Verdict;
@@ -455,9 +457,19 @@ fn serve_passphrase(
 	let volume = config.name.as_str();
 	notice!("volume {volume:?}: plain phase, so every token type has already failed");
 
-	match acquire(volume, config, cache) {
+	// Opened once, and every child handed this descriptor rather than the
+	// path, so validation and enrollment cannot end up on different disks.
+	let device = match Device::open(&config.device) {
+		Ok(d) => d,
+		Err(e) => {
+			error!("volume {volume:?}: cannot open its device ({e}); declining");
+			return;
+		}
+	};
+
+	match acquire(volume, config, &device, cache) {
 		Some(secret) => {
-			maybe_reenroll(volume, config, &secret, decided);
+			maybe_reenroll(volume, config, &device, &secret, decided);
 			reply(conn, volume, &secret)
 		}
 		// Declining hands the prompt back to systemd-cryptsetup, which asks the
@@ -476,6 +488,7 @@ fn serve_passphrase(
 fn maybe_reenroll(
 	volume: &str,
 	config: &Volume,
+	device: &Device,
 	secret: &Secret,
 	decided: &mut consent::Decisions,
 ) {
@@ -489,7 +502,7 @@ fn maybe_reenroll(
 		}
 	};
 
-	let plan = match preflight::check(volume, config, &mut tpm) {
+	let plan = match preflight::check(volume, config, device, &mut tpm) {
 		preflight::Decision::Reenroll(plan) => plan,
 		preflight::Decision::Leave(why) => {
 			notice!("volume {volume:?}: leaving the header alone: {why}");
@@ -540,7 +553,7 @@ fn maybe_reenroll(
 	}
 
 	if let Err(e) = enroll::run(
-		&config.device,
+		device,
 		&config.tpm2_device,
 		&config.pcrs,
 		config.bank,
@@ -555,14 +568,20 @@ fn maybe_reenroll(
 		return;
 	}
 
-	verify(volume, config, &plan, &mut tpm);
+	verify(volume, config, device, &plan, &mut tpm);
 }
 
 /// Check the new slot before trusting it. The old slot is gone by now, so a
 /// failure is worth saying loudly -- though the passphrase slot was never
 /// involved, so it is not a disaster.
-fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2::Tpm) {
-	let tokens = match token::read(&config.device) {
+fn verify(
+	volume: &str,
+	config: &Volume,
+	device: &Device,
+	plan: &preflight::Plan,
+	tpm: &mut tpm2::Tpm,
+) {
+	let tokens = match token::read(device) {
 		Ok(t) => t,
 		Err(e) => {
 			error!("volume {volume:?}: re-enrolled, but the header could not be re-read ({e})");
@@ -592,7 +611,7 @@ fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2:
 
 	// --token-only refuses to fall back to a passphrase, so success here is a
 	// TPM2 unseal and nothing else.
-	match enroll::test_unseal(&config.device, new.index) {
+	match enroll::test_unseal(device, new.index) {
 		Ok(()) => {
 			notice!(
 				"volume {volume:?}: re-enrolled as token {} and verified by unsealing it",
@@ -631,8 +650,8 @@ fn verify(volume: &str, config: &Volume, plan: &preflight::Plan, tpm: &mut tpm2:
 /// only the first prompts. Every candidate, cached or freshly typed, is
 /// validated before it is returned -- which is what makes it safe to accept a
 /// secret we did not watch the user type.
-fn acquire(volume: &str, config: &Volume, cache: &mut Cache) -> Option<Secret> {
-	let device = config.device.as_str();
+fn acquire(volume: &str, config: &Volume, device: &Device, cache: &mut Cache) -> Option<Secret> {
+	let path = config.device.as_str();
 
 	if !cache.is_empty() {
 		// Each trial is a full KDF pass, so this line explains a multi-second
@@ -651,7 +670,7 @@ fn acquire(volume: &str, config: &Volume, cache: &mut Cache) -> Option<Secret> {
 			}
 			Verdict::Wrong => {}
 			Verdict::Unusable(why) => {
-				error!("volume {volume:?}: cannot check passphrases against {device} ({why})");
+				error!("volume {volume:?}: cannot check passphrases against {path} ({why})");
 				return None;
 			}
 		}
@@ -664,7 +683,7 @@ fn acquire(volume: &str, config: &Volume, cache: &mut Cache) -> Option<Secret> {
 			Attempt::Retry
 		};
 
-		let candidates = match askpw::ask(volume, device, which) {
+		let candidates = match askpw::ask(volume, path, which) {
 			Ok(c) => c,
 			Err(e) => {
 				error!("volume {volume:?}: could not acquire a passphrase ({e})");
@@ -680,14 +699,14 @@ fn acquire(volume: &str, config: &Volume, cache: &mut Cache) -> Option<Secret> {
 				}
 				Verdict::Wrong => {}
 				Verdict::Unusable(why) => {
-					error!("volume {volume:?}: cannot check passphrases against {device} ({why})");
+					error!("volume {volume:?}: cannot check passphrases against {path} ({why})");
 					return None;
 				}
 			}
 		}
 
 		notice!(
-			"volume {volume:?}: passphrase did not unlock {device} (attempt {} of {TRIES})",
+			"volume {volume:?}: passphrase did not unlock {path} (attempt {} of {TRIES})",
 			attempt + 1
 		);
 	}

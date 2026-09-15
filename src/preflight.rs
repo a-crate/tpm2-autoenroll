@@ -17,6 +17,7 @@
 //! | the PCRs actually drifted | if they match, re-sealing changes nothing and the next boot fails identically |
 
 use crate::config::{self, Volume};
+use crate::device::Device;
 use crate::drift::{self, Drift};
 use crate::log::{error, info};
 use crate::token::{self, Tpm2Token};
@@ -45,9 +46,7 @@ pub struct Plan {
 	pub state: Vec<u8>,
 }
 
-pub fn check(volume: &str, config: &Volume, tpm: &mut Tpm) -> Decision {
-	let device = config.device.as_str();
-
+pub fn check(volume: &str, config: &Volume, device: &Device, tpm: &mut Tpm) -> Decision {
 	let tokens = match token::read(device) {
 		Ok(t) => t,
 		Err(e) => return Decision::Leave(format!("could not read the LUKS2 tokens: {e}")),

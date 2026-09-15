@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::child;
+use crate::device::Device;
 use crate::memfd::SecretFile;
 use crate::secret::Secret;
 
@@ -33,7 +34,7 @@ pub enum Verdict {
 	Unusable(String),
 }
 
-pub fn test_passphrase(device: &str, secret: &Secret) -> Verdict {
+pub fn test_passphrase(device: &Device, secret: &Secret) -> Verdict {
 	let key = match SecretFile::new(secret) {
 		Ok(k) => k,
 		Err(e) => return Verdict::Unusable(e),
@@ -52,11 +53,12 @@ pub fn test_passphrase(device: &str, secret: &Secret) -> Verdict {
 		.arg("--disable-external-tokens")
 		.arg("--disable-keyring")
 		.arg(format!("--key-file={}", key.path()))
-		.arg(device)
+		.arg(device.path())
 		.stdin(Stdio::null())
 		.stdout(Stdio::null())
 		.stderr(Stdio::piped());
 	key.attach(&mut cmd);
+	device.attach(&mut cmd);
 
 	let out = match child::run(&mut cmd, TIMEOUT, 0) {
 		Ok(o) => o,

@@ -11,6 +11,8 @@
 //! `Vec` would leave unwiped copies behind in every allocation it outgrew.
 
 use std::io::Read;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
@@ -62,6 +64,33 @@ pub fn run(cmd: &mut Command, timeout: Duration, stdout_cap: usize) -> Result<Ou
 			timeout.as_secs()
 		)),
 		Err(e) => Err(format!("{program}: {e}")),
+	}
+}
+
+/// `/proc/self/fd/<n>` for `fd`, for the argv of a child `inherit` was called
+/// for. It resolves in the *child's* fd table, where the number is only valid
+/// because `inherit` kept it open across the exec. Opening the link re-opens
+/// the file itself at offset zero, so one descriptor can serve several
+/// children in turn.
+pub fn fd_path(fd: &OwnedFd) -> String {
+	format!("/proc/self/fd/{}", fd.as_raw_fd())
+}
+
+/// Keep `fd` open across `cmd`'s exec. Clearing `FD_CLOEXEC` in the parent
+/// would leak it into every later child, `systemd-ask-password` included;
+/// doing it in the pre-exec hook confines it to this one.
+pub fn inherit(cmd: &mut Command, fd: &OwnedFd) {
+	let raw = fd.as_raw_fd();
+	// SAFETY: the closure runs in the forked child between fork and exec,
+	// where only async-signal-safe calls are permitted. fcntl is one, and it
+	// allocates nothing.
+	unsafe {
+		cmd.pre_exec(move || {
+			if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
+				return Err(std::io::Error::last_os_error());
+			}
+			Ok(())
+		});
 	}
 }
 

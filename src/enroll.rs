@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::child;
+use crate::device::Device;
 use crate::memfd::SecretFile;
 use crate::secret::Secret;
 use crate::token::Tpm2Token;
@@ -29,7 +30,7 @@ const UNSEAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Re-bind `device` to the PCR state it is in right now. `pcrs` and `bank` come
 /// from the config.
 pub fn run(
-	device: &str,
+	device: &Device,
 	tpm2_device: &str,
 	pcrs: &[u8],
 	bank: Bank,
@@ -59,11 +60,12 @@ pub fn run(
 		.arg("--tpm2-public-key=")
 		.arg("--tpm2-pcrlock=")
 		.arg("--tpm2-with-pin=no")
-		.arg(device)
+		.arg(device.path())
 		.stdin(Stdio::null())
 		.stdout(Stdio::null())
 		.stderr(Stdio::piped());
 	key.attach(&mut cmd);
+	device.attach(&mut cmd);
 
 	let out = child::run(&mut cmd, ENROLL_TIMEOUT, 0)?;
 
@@ -96,7 +98,7 @@ fn pcr_spec(pcrs: &[u8], bank: &str) -> String {
 /// TPM2 unseal and nothing else. Without
 /// `libcryptsetup-token-systemd-tpm2.so` this route is unavailable and the
 /// caller falls back to comparing policy digests.
-pub fn test_unseal(device: &str, token_index: u32) -> Result<(), String> {
+pub fn test_unseal(device: &Device, token_index: u32) -> Result<(), String> {
 	let mut cmd = Command::new("cryptsetup");
 	cmd.arg("open")
 		.arg("--test-passphrase")
@@ -104,10 +106,11 @@ pub fn test_unseal(device: &str, token_index: u32) -> Result<(), String> {
 		.arg("--token-only")
 		.arg(format!("--token-id={token_index}"))
 		.arg("--disable-keyring")
-		.arg(device)
+		.arg(device.path())
 		.stdin(Stdio::null())
 		.stdout(Stdio::null())
 		.stderr(Stdio::piped());
+	device.attach(&mut cmd);
 	let out = child::run(&mut cmd, UNSEAL_TIMEOUT, 0)?;
 
 	if out.status.success() {
@@ -169,11 +172,12 @@ mod tests {
 	#[test]
 	fn refuses_an_empty_selection() {
 		// Checked before anything is spawned, so no device or TPM is needed.
+		let device = Device::unchecked("/dev/null");
 		let secret = Secret::new(b"unused".to_vec());
-		let actual = run("/nonexistent", "auto", &[], Bank::SHA256, &secret);
+		let actual = run(&device, "auto", &[], Bank::SHA256, &secret);
 		assert!(
 			actual.is_err(),
-			"run(\"/nonexistent\", \"auto\", [], SHA256, _) returned {actual:?}, expected Err"
+			"run(</dev/null>, \"auto\", [], SHA256, _) returned {actual:?}, expected Err"
 		);
 	}
 

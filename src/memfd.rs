@@ -12,10 +12,10 @@
 //! systemd-cryptsetup would have received from us.
 
 use std::io::Write;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::OwnedFd;
 use std::process::Command;
 
+use crate::child;
 use crate::secret::Secret;
 
 pub struct SecretFile {
@@ -40,33 +40,14 @@ impl SecretFile {
 		})
 	}
 
-	/// The path to hand the child.
-	///
-	/// `/proc/self/fd/<n>` resolves in the *child's* fd table, which is why
-	/// [`Self::attach`] has to run first: the number is ours, and only survives
-	/// the exec because we clear `FD_CLOEXEC` after the fork. Opening the link
-	/// re-opens the memfd at offset zero, so the same `SecretFile` can be handed
-	/// to several children in turn.
+	/// The path to hand the child; see `child::fd_path`. Only this one child:
+	/// the key must not leak into `systemd-ask-password`.
 	pub fn path(&self) -> String {
-		format!("/proc/self/fd/{}", self.fd.as_raw_fd())
+		child::fd_path(&self.fd)
 	}
 
-	/// Clearing `FD_CLOEXEC` in the parent would leak the key into every
-	/// subsequent child, including `systemd-ask-password`. Doing it in the
-	/// pre-exec hook confines it to this one process.
 	pub fn attach(&self, cmd: &mut Command) {
-		let raw = self.fd.as_raw_fd();
-		// SAFETY: the closure runs in the forked child between fork and exec,
-		// where only async-signal-safe calls are permitted. fcntl is one, and
-		// it allocates nothing.
-		unsafe {
-			cmd.pre_exec(move || {
-				if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
-					return Err(std::io::Error::last_os_error());
-				}
-				Ok(())
-			});
-		}
+		child::inherit(cmd, &self.fd);
 	}
 }
 
