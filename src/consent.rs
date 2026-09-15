@@ -81,7 +81,7 @@ pub fn ask(volume: &str, device: &str, pcrs: &[u8], bank: Bank) -> Answer {
 		.arg("--emoji=yes")
 		// Distinct from the passphrase prompt's id for the same disk, so an agent
 		// cannot mistake one question for a repeat of the other.
-		.arg(format!("--id=tpm2-autoenroll:{device}"))
+		.arg(format!("--id=tpm2-autoenroll:{}", askpw::cescape(device)))
 		.arg("--echo=yes")
 		.arg(format!("--timeout={}", askpw::PROMPT_TIMEOUT.as_secs()))
 		.arg("-n")

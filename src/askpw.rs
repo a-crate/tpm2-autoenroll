@@ -119,7 +119,7 @@ fn friendly_name(volume: &str, device: &str) -> String {
 /// A device path normally passes through untouched, but one whose name held a
 /// quote or a control character would otherwise produce an id systemd would
 /// never generate, defeating the point of matching systemd's id at all.
-fn cescape(s: &str) -> String {
+pub fn cescape(s: &str) -> String {
 	let mut out = String::with_capacity(s.len());
 	for b in s.bytes() {
 		match b {
