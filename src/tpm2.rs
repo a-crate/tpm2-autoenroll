@@ -14,6 +14,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::fs::FileType;
 
 /// How long one command may take to answer. Connections are handled serially,
 /// so a TPM that never answers would otherwise hold every other volume's
@@ -110,6 +111,14 @@ impl Tpm {
 			.write(true)
 			.open(path)
 			.map_err(|e| format!("{path}: {e}"))?;
+
+		// Everything after this writes commands to the file, so a typo naming a
+		// block device would put them over the start of a disk -- its LUKS
+		// header, likely enough.
+		let stat = rustix::fs::fstat(&file).map_err(|e| format!("{path}: {e}"))?;
+		if FileType::from_raw_mode(stat.st_mode as u32) != FileType::CharacterDevice {
+			return Err(format!("{path} is not a character device, so not a TPM"));
+		}
 		Ok(Tpm { device: file })
 	}
 
@@ -651,6 +660,21 @@ mod tests {
 			lengths,
 			vec![32, 32],
 			"parse_pcr_read(<two sha256 digests>) returned digest lengths {lengths:?}, expected [32, 32]"
+		);
+	}
+
+	#[test]
+	fn open_refuses_anything_but_a_character_device() {
+		let path =
+			std::env::temp_dir().join(format!("tpm2-autoenroll-not-a-tpm-{}", std::process::id()));
+		std::fs::write(&path, b"").expect("could not create the test file");
+		let path = path.to_str().expect("the temp path is not UTF-8");
+
+		let actual = Tpm::open(path).map(|_| ());
+		let _ = std::fs::remove_file(path);
+		assert!(
+			actual.is_err(),
+			"Tpm::open({path:?}) on a regular file returned {actual:?}, expected Err"
 		);
 	}
 
