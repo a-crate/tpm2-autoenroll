@@ -5,6 +5,10 @@
 //! healthy ones included -- and `Wants=` does not help, since the daemon started
 //! fine. A timeout fails the step it belongs to, which every caller already
 //! turns into a decline or a `Leave`.
+//!
+//! stdout can carry passphrases (`systemd-ask-password`), so it is read into a
+//! buffer allocated once at a fixed capacity and wiped on drop. A growing
+//! `Vec` would leave unwiped copies behind in every allocation it outgrew.
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus};
@@ -12,22 +16,30 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::process::{Pid, PidfdFlags};
+use zeroize::{Zeroize, Zeroizing};
+
+/// stderr is only ever logged, but still has a bound.
+const STDERR_CAP: usize = 64 * 1024;
+
+/// How much one read may take.
+const CHUNK: usize = 64 * 1024;
 
 pub struct Output {
 	pub status: ExitStatus,
-	pub stdout: Vec<u8>,
+	pub stdout: Zeroizing<Vec<u8>>,
 	pub stderr: Vec<u8>,
 }
 
 /// Spawn `cmd`, collect whichever of stdout and stderr the caller piped, and
-/// kill it if it is still running after `timeout`.
-pub fn run(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+/// kill it if it is still running after `timeout`. More than `stdout_cap`
+/// bytes on stdout is an error.
+pub fn run(cmd: &mut Command, timeout: Duration, stdout_cap: usize) -> Result<Output, String> {
 	let program = cmd.get_program().to_string_lossy().into_owned();
 	let mut child = cmd
 		.spawn()
 		.map_err(|e| format!("could not run {program}: {e}"))?;
 
-	let collected = collect(&mut child, timeout);
+	let collected = collect(&mut child, timeout, stdout_cap);
 	if !matches!(collected, Ok(Some(_))) {
 		// Not yet reaped, so the pid is still this child's.
 		let _ = child.kill();
@@ -53,10 +65,14 @@ pub fn run(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
 	}
 }
 
-type Collected = (Vec<u8>, Vec<u8>);
+type Collected = (Zeroizing<Vec<u8>>, Vec<u8>);
 
 /// `None` when the deadline passed first.
-fn collect(child: &mut Child, timeout: Duration) -> Result<Option<Collected>, String> {
+fn collect(
+	child: &mut Child,
+	timeout: Duration,
+	stdout_cap: usize,
+) -> Result<Option<Collected>, String> {
 	let deadline = Instant::now() + timeout;
 	let pid = Pid::from_raw(child.id() as i32).ok_or("the child has no pid")?;
 	let pidfd = rustix::process::pidfd_open(pid, PidfdFlags::empty())
@@ -64,8 +80,8 @@ fn collect(child: &mut Child, timeout: Duration) -> Result<Option<Collected>, St
 
 	let mut stdout_pipe = child.stdout.take();
 	let mut stderr_pipe = child.stderr.take();
-	let mut stdout = Vec::new();
-	let mut stderr = Vec::new();
+	let mut stdout = Zeroizing::new(Vec::with_capacity(stdout_cap));
+	let mut stderr = Vec::with_capacity(STDERR_CAP);
 	let mut exited = false;
 
 	// Both pipes are drained while the child runs, not after it exits: a child
@@ -108,27 +124,54 @@ fn collect(child: &mut Child, timeout: Duration) -> Result<Option<Collected>, St
 			exited = true;
 		}
 		if stdout_ready {
-			drain(&mut stdout_pipe, &mut stdout)?;
+			drain(&mut stdout_pipe, &mut stdout, stdout_cap)?;
 		}
 		if stderr_ready {
-			drain(&mut stderr_pipe, &mut stderr)?;
+			drain(&mut stderr_pipe, &mut stderr, STDERR_CAP)?;
 		}
 	}
 
 	Ok(Some((stdout, stderr)))
 }
 
-/// One read's worth. End of file closes the pipe.
-fn drain<R: Read>(pipe: &mut Option<R>, into: &mut Vec<u8>) -> Result<(), String> {
+/// One read's worth, straight into `into`. It never grows past `cap`, which
+/// its capacity already covers, so it never reallocates. End of file closes
+/// the pipe.
+fn drain<R: Read>(pipe: &mut Option<R>, into: &mut Vec<u8>, cap: usize) -> Result<(), String> {
 	let Some(p) = pipe else {
 		return Ok(());
 	};
-	let mut buf = [0u8; 4096];
-	match p.read(&mut buf) {
-		Ok(0) => *pipe = None,
-		Ok(n) => into.extend_from_slice(&buf[..n]),
-		Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-		Err(e) => return Err(format!("reading from the child: {e}")),
+
+	let start = into.len();
+	if start == cap {
+		// Full, so any more is too much; one byte is enough to tell.
+		let mut probe = [0u8; 1];
+		let read = p.read(&mut probe);
+		probe.zeroize();
+		return match read {
+			Ok(0) => {
+				*pipe = None;
+				Ok(())
+			}
+			Ok(_) => Err(format!("wrote more than {cap} bytes")),
+			Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(()),
+			Err(e) => Err(format!("reading from the child: {e}")),
+		};
+	}
+
+	into.resize(start + (cap - start).min(CHUNK), 0);
+	let read = p.read(&mut into[start..]);
+	match read {
+		Ok(0) => {
+			into.truncate(start);
+			*pipe = None;
+		}
+		Ok(n) => into.truncate(start + n),
+		Err(e) if e.kind() == std::io::ErrorKind::Interrupted => into.truncate(start),
+		Err(e) => {
+			into.truncate(start);
+			return Err(format!("reading from the child: {e}"));
+		}
 	}
 	Ok(())
 }
@@ -144,28 +187,55 @@ mod tests {
 		cmd.args(["-c", "printf out; printf err >&2; exit 3"])
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped());
-		let out = run(&mut cmd, Duration::from_secs(10))
-			.unwrap_or_else(|e| panic!("run(sh -c ..., 10s) returned Err({e}), expected Ok"));
-		let actual = (out.status.code(), out.stdout, out.stderr);
+		let out = run(&mut cmd, Duration::from_secs(10), 16)
+			.unwrap_or_else(|e| panic!("run(sh -c ..., 10s, 16) returned Err({e}), expected Ok"));
+		let actual = (out.status.code(), out.stdout.to_vec(), out.stderr);
 		let expected = (Some(3), b"out".to_vec(), b"err".to_vec());
 		assert_eq!(
 			actual, expected,
-			"run(sh -c 'printf out; printf err >&2; exit 3', 10s) returned {actual:?}, expected {expected:?}"
+			"run(sh -c 'printf out; printf err >&2; exit 3', 10s, 16) returned {actual:?}, expected {expected:?}"
 		);
 	}
 
 	#[test]
 	fn output_larger_than_a_pipe_does_not_deadlock() {
 		// A pipe holds 64 KiB. Reading only after the child exits would leave
-		// this child blocked on a full pipe until the deadline.
+		// this child blocked on a full pipe until the deadline. Exactly at the
+		// cap is still within it.
 		let mut cmd = Command::new("sh");
 		cmd.args(["-c", "head -c 1000000 /dev/zero"])
 			.stdout(Stdio::piped());
-		let actual = run(&mut cmd, Duration::from_secs(10)).map(|o| o.stdout.len());
+		let actual = run(&mut cmd, Duration::from_secs(10), 1_000_000).map(|o| o.stdout.len());
 		assert_eq!(
 			actual,
 			Ok(1_000_000),
-			"run(head -c 1000000 /dev/zero, 10s) returned stdout length {actual:?}, expected Ok(1000000)"
+			"run(head -c 1000000 /dev/zero, 10s, 1000000) returned stdout length {actual:?}, expected Ok(1000000)"
+		);
+	}
+
+	#[test]
+	fn stdout_past_the_cap_is_an_error() {
+		let mut cmd = Command::new("sh");
+		cmd.args(["-c", "head -c 1000 /dev/zero"])
+			.stdout(Stdio::piped());
+		let actual = run(&mut cmd, Duration::from_secs(10), 999).map(|o| o.stdout.len());
+		assert!(
+			actual.is_err(),
+			"run(head -c 1000 /dev/zero, 10s, 999) returned {actual:?}, expected Err"
+		);
+	}
+
+	#[test]
+	fn the_stdout_buffer_is_never_reallocated() {
+		let mut cmd = Command::new("sh");
+		cmd.args(["-c", "head -c 200000 /dev/zero"])
+			.stdout(Stdio::piped());
+		let out = run(&mut cmd, Duration::from_secs(10), 300_000)
+			.unwrap_or_else(|e| panic!("run(head -c 200000, 10s, 300000) returned Err({e})"));
+		let actual = out.stdout.capacity();
+		assert_eq!(
+			actual, 300_000,
+			"run(head -c 200000, 10s, 300000) left stdout capacity {actual}, expected 300000: a different capacity means it was reallocated"
 		);
 	}
 
@@ -174,15 +244,15 @@ mod tests {
 		let mut cmd = Command::new("sleep");
 		cmd.arg("30");
 		let started = Instant::now();
-		let actual = run(&mut cmd, Duration::from_millis(200)).map(|o| o.status);
+		let actual = run(&mut cmd, Duration::from_millis(200), 0).map(|o| o.status);
 		let elapsed = started.elapsed();
 		assert!(
 			actual.is_err(),
-			"run(sleep 30, 200ms) returned {actual:?}, expected Err"
+			"run(sleep 30, 200ms, 0) returned {actual:?}, expected Err"
 		);
 		assert!(
 			elapsed < Duration::from_secs(5),
-			"run(sleep 30, 200ms) took {elapsed:?}, expected well under 5s"
+			"run(sleep 30, 200ms, 0) took {elapsed:?}, expected well under 5s"
 		);
 	}
 }

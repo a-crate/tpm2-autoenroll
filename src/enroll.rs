@@ -65,7 +65,7 @@ pub fn run(
 		.stderr(Stdio::piped());
 	key.attach(&mut cmd);
 
-	let out = child::run(&mut cmd, ENROLL_TIMEOUT)?;
+	let out = child::run(&mut cmd, ENROLL_TIMEOUT, 0)?;
 
 	if !out.status.success() {
 		let stderr = String::from_utf8_lossy(&out.stderr);
@@ -108,7 +108,7 @@ pub fn test_unseal(device: &str, token_index: u32) -> Result<(), String> {
 		.stdin(Stdio::null())
 		.stdout(Stdio::null())
 		.stderr(Stdio::piped());
-	let out = child::run(&mut cmd, UNSEAL_TIMEOUT)?;
+	let out = child::run(&mut cmd, UNSEAL_TIMEOUT, 0)?;
 
 	if out.status.success() {
 		return Ok(());

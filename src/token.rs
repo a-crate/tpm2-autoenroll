@@ -22,6 +22,10 @@ const BINARY: &str = "cryptsetup";
 /// Reading the header involves no KDF, so this is generous.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A LUKS2 JSON area is at most 4 MiB; the rest is room for luksDump's own
+/// formatting.
+const MAX_JSON: usize = 16 * 1024 * 1024;
+
 /// A `systemd-tpm2` token as it sits in the header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tpm2Token {
@@ -69,7 +73,7 @@ pub fn read(device: &str) -> Result<Vec<Tpm2Token>, String> {
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped());
-	let out = child::run(&mut cmd, TIMEOUT)?;
+	let out = child::run(&mut cmd, TIMEOUT, MAX_JSON)?;
 
 	if !out.status.success() {
 		let stderr = String::from_utf8_lossy(&out.stderr);

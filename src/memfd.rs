@@ -20,6 +20,7 @@ use crate::secret::Secret;
 
 pub struct SecretFile {
 	fd: OwnedFd,
+	len: usize,
 }
 
 impl SecretFile {
@@ -33,7 +34,10 @@ impl SecretFile {
 		file.flush()
 			.map_err(|e| format!("flushing the key to a memfd: {e}"))?;
 
-		Ok(SecretFile { fd: file.into() })
+		Ok(SecretFile {
+			fd: file.into(),
+			len: secret.len(),
+		})
 	}
 
 	/// The path to hand the child.
@@ -66,9 +70,48 @@ impl SecretFile {
 	}
 }
 
+/// A memfd's pages are not wiped when its last descriptor closes; they linger
+/// in physical memory until reused. Overwriting them first means what lingers
+/// is zeros. Errors are ignored: there is nothing left to do but close.
+impl Drop for SecretFile {
+	fn drop(&mut self) {
+		let zeros = [0u8; 4096];
+		let mut at = 0;
+		while at < self.len {
+			let n = (self.len - at).min(zeros.len());
+			match rustix::io::pwrite(&self.fd, &zeros[..n], at as u64) {
+				Ok(0) | Err(_) => break,
+				Ok(written) => at += written,
+			}
+		}
+		let _ = rustix::fs::ftruncate(&self.fd, 0);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::io::Read;
+
+	#[test]
+	fn dropping_wipes_the_memfd() {
+		// A second open of the procfs link is a separate file description on
+		// the same memfd, so it outlives the SecretFile and sees what it left.
+		let secret = Secret::new(b"correct-horse".to_vec());
+		let file = SecretFile::new(&secret).expect("SecretFile::new returned Err, expected Ok");
+		let mut reopened =
+			std::fs::File::open(file.path()).expect("reopening the memfd path returned Err");
+		drop(file);
+
+		let mut actual = Vec::new();
+		reopened
+			.read_to_end(&mut actual)
+			.expect("reading the reopened memfd returned Err");
+		assert!(
+			actual.is_empty(),
+			"reading a SecretFile's memfd after dropping it returned {actual:?}, expected no bytes"
+		);
+	}
 
 	#[test]
 	fn the_path_reads_back_the_secret() {

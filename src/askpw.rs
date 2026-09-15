@@ -28,6 +28,11 @@ pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
 /// agent that wedges rather than timing out.
 pub const PROMPT_GRACE: Duration = Duration::from_secs(30);
 
+/// Far more than `MAX_CANDIDATES` passphrases need. More than this is an
+/// error rather than a reason to grow the buffer, which would leave an
+/// unwiped copy behind.
+const MAX_OUTPUT: usize = 64 * 1024;
+
 /// How many candidates from one prompt we are willing to try.
 ///
 /// `--multiple` can return every passphrase cached this boot, and each rejection
@@ -76,7 +81,7 @@ pub fn ask(volume: &str, device: &str, attempt: Attempt) -> Result<Vec<Secret>, 
 	.stdout(Stdio::piped())
 	.stderr(Stdio::inherit());
 
-	let out = child::run(&mut cmd, PROMPT_TIMEOUT + PROMPT_GRACE)?;
+	let out = child::run(&mut cmd, PROMPT_TIMEOUT + PROMPT_GRACE, MAX_OUTPUT)?;
 
 	// A timeout is reported this way too, and declining on it is right: the
 	// prompt reverts to systemd-cryptsetup, which applies its own timeout.

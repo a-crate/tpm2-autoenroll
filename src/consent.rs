@@ -90,7 +90,9 @@ pub fn ask(volume: &str, device: &str, pcrs: &[u8], bank: Bank) -> Answer {
 		.stdout(Stdio::piped())
 		.stderr(Stdio::inherit());
 
-	let out = match child::run(&mut cmd, askpw::PROMPT_TIMEOUT + askpw::PROMPT_GRACE) {
+	// The answer is a word or two; anything longer is not an answer.
+	let timeout = askpw::PROMPT_TIMEOUT + askpw::PROMPT_GRACE;
+	let out = match child::run(&mut cmd, timeout, 4096) {
 		Ok(o) if o.status.success() => o,
 		Ok(o) => {
 			crate::log::notice!(

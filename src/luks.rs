@@ -58,7 +58,7 @@ pub fn test_passphrase(device: &str, secret: &Secret) -> Verdict {
 		.stderr(Stdio::piped());
 	key.attach(&mut cmd);
 
-	let out = match child::run(&mut cmd, TIMEOUT) {
+	let out = match child::run(&mut cmd, TIMEOUT, 0) {
 		Ok(o) => o,
 		Err(e) => return Verdict::Unusable(e),
 	};
