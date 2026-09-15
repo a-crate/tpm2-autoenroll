@@ -13,6 +13,16 @@
 use std::fs::File;
 use std::io::{Read, Write};
 
+use rustix::event::{PollFd, PollFlags, Timespec};
+
+/// How long one command may take to answer. Connections are handled serially,
+/// so a TPM that never answers would otherwise hold every other volume's
+/// connection in the backlog, healthy ones included.
+const RESPONSE_TIMEOUT: Timespec = Timespec {
+	tv_sec: 30,
+	tv_nsec: 0,
+};
+
 /// TPM_ST_NO_SESSIONS. Every command here is unauthenticated.
 const ST_NO_SESSIONS: u16 = 0x8001;
 
@@ -109,6 +119,24 @@ impl Tpm {
 			.write_all(&cmd)
 			.map_err(|e| format!("writing command {cc:#010x} to the TPM: {e}"))?;
 
+		// poll writes revents into the array it is given, so the PollFd has to
+		// be read back from there rather than from a copy.
+		let mut fds = [PollFd::new(&self.device, PollFlags::IN)];
+		match rustix::event::poll(&mut fds, Some(&RESPONSE_TIMEOUT)) {
+			Ok(0) => {
+				return Err(format!(
+					"no response to command {cc:#010x} within {} seconds",
+					RESPONSE_TIMEOUT.tv_sec
+				))
+			}
+			Ok(_) => {}
+			Err(e) => {
+				return Err(format!(
+					"waiting for the response to command {cc:#010x}: {e}"
+				))
+			}
+		}
+
 		let mut buf = vec![0u8; MAX_RESPONSE];
 		let n = self
 			.device
@@ -145,20 +173,7 @@ impl Tpm {
 			put_pcr_selection(&mut body, bank, &remaining);
 
 			let payload = self.transact(CC_PCR_READ, &body)?;
-			let (returned, digests) = parse_pcr_read(&payload)?;
-
-			if returned.is_empty() || digests.len() != returned.len() {
-				return Err(format!(
-					"the TPM returned {} digest(s) for {} PCR(s)",
-					digests.len(),
-					returned.len()
-				));
-			}
-
-			for (pcr, digest) in returned.iter().zip(digests) {
-				out.push((*pcr, digest));
-			}
-			remaining.retain(|p| !returned.contains(p));
+			absorb(&mut remaining, &mut out, parse_pcr_read(&payload)?)?;
 		}
 
 		out.sort_by_key(|(pcr, _)| *pcr);
@@ -340,6 +355,39 @@ fn parse_properties(payload: &[u8]) -> Result<Lockout, String> {
 
 type PcrRead = (Vec<u8>, Vec<Vec<u8>>);
 
+/// Fold one PCR_Read round into `out`.
+///
+/// Every round must answer for at least one outstanding PCR and for nothing
+/// else. That is what guarantees `read_pcrs`' loop ends: a TPM answering with
+/// PCRs nobody asked for would otherwise have it re-ask forever.
+fn absorb(
+	remaining: &mut Vec<u8>,
+	out: &mut Vec<(u8, Vec<u8>)>,
+	(returned, digests): PcrRead,
+) -> Result<(), String> {
+	if returned.is_empty() || digests.len() != returned.len() {
+		return Err(format!(
+			"the TPM returned {} digest(s) for {} PCR(s)",
+			digests.len(),
+			returned.len()
+		));
+	}
+	if returned.windows(2).any(|w| w[0] == w[1]) {
+		return Err(format!(
+			"the TPM returned PCRs {returned:?}, which repeats one"
+		));
+	}
+	if let Some(pcr) = returned.iter().find(|p| !remaining.contains(p)) {
+		return Err(format!(
+			"the TPM returned PCR {pcr}, which is not among the outstanding {remaining:?}"
+		));
+	}
+
+	remaining.retain(|p| !returned.contains(p));
+	out.extend(returned.into_iter().zip(digests));
+	Ok(())
+}
+
 fn parse_pcr_read(payload: &[u8]) -> Result<PcrRead, String> {
 	let mut r = Reader::new(payload);
 	let _update_counter = r.u32()?;
@@ -353,7 +401,11 @@ fn parse_pcr_read(payload: &[u8]) -> Result<PcrRead, String> {
 		for (byte, bits) in bitmap.iter().enumerate() {
 			for bit in 0..8 {
 				if bits & (1 << bit) != 0 {
-					returned.push((byte * 8 + bit) as u8);
+					let pcr = byte * 8 + bit;
+					if pcr > 23 {
+						return Err(format!("PCR {pcr} is out of range"));
+					}
+					returned.push(pcr as u8);
 				}
 			}
 		}
@@ -599,6 +651,65 @@ mod tests {
 			lengths,
 			vec![32, 32],
 			"parse_pcr_read(<two sha256 digests>) returned digest lengths {lengths:?}, expected [32, 32]"
+		);
+	}
+
+	#[test]
+	fn a_round_answering_only_the_unasked_is_refused() {
+		// Asked for 7, got 0 back: before, read_pcrs would re-ask for 7 forever.
+		let mut remaining = vec![7];
+		let mut out = Vec::new();
+		let actual = absorb(&mut remaining, &mut out, (vec![0], vec![vec![0xaa; 32]]));
+		assert!(
+			actual.is_err(),
+			"absorb(remaining = [7], returned = [0]) returned {actual:?}, expected Err"
+		);
+	}
+
+	#[test]
+	fn a_partial_round_leaves_the_rest_outstanding() {
+		let mut remaining: Vec<u8> = (0..10).collect();
+		let mut out = Vec::new();
+		let returned: Vec<u8> = (0..8).collect();
+		let digests = vec![vec![0xaa; 32]; 8];
+		let actual = absorb(&mut remaining, &mut out, (returned, digests));
+		assert_eq!(
+			actual,
+			Ok(()),
+			"absorb(remaining = 0..10, returned = 0..8) returned {actual:?}, expected Ok(())"
+		);
+		assert_eq!(
+			remaining,
+			vec![8, 9],
+			"absorb(remaining = 0..10, returned = 0..8) left remaining {remaining:?}, expected [8, 9]"
+		);
+		assert_eq!(
+			out.len(),
+			8,
+			"absorb(remaining = 0..10, returned = 0..8) produced {} digests, expected 8",
+			out.len()
+		);
+	}
+
+	#[test]
+	fn a_selection_bitmap_past_pcr_23_is_refused() {
+		// sizeofSelect 40 reaches bit 319. Casting that to u8 used to wrap it
+		// onto a real PCR index.
+		let mut bitmap = [0u8; 40];
+		bitmap[37] = 0x10; // bit 300
+		let mut payload = Vec::new();
+		put_u32(&mut payload, 0);
+		put_u32(&mut payload, 1);
+		put_u16(&mut payload, Bank::SHA256.0);
+		payload.push(bitmap.len() as u8);
+		payload.extend_from_slice(&bitmap);
+		put_u32(&mut payload, 1);
+		put_tpm2b(&mut payload, &[0xaa; 32]);
+
+		let actual = parse_pcr_read(&payload);
+		assert!(
+			actual.is_err(),
+			"parse_pcr_read(<sizeofSelect 40, bit 300 set>) returned {actual:?}, expected Err"
 		);
 	}
 
