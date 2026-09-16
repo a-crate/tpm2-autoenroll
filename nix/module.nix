@@ -315,15 +315,6 @@ in
         '';
       }
       {
-        assertion = !inInitrd || config.boot.initrd.systemd.enable;
-        message = ''
-          services.tpm2-autoenroll has initrd volumes, which requires
-          boot.initrd.systemd.enable. The whole mechanism is
-          systemd-cryptsetup's key-discovery path; the scripted initrd does not
-          have one.
-        '';
-      }
-      {
         assertion = !inInitrd || config.boot.initrd.systemd.tpm2.enable;
         message = ''
           services.tpm2-autoenroll has initrd volumes, which requires
