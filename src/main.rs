@@ -415,9 +415,9 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 			match rustix::net::accept(&l.fd) {
 				Ok(conn) => {
 					if handle(conn, &l.volume, &mut cache, &mut decided) {
+					    last_contact = Instant::now();
 						served.insert(l.volume.name.clone());
 					}
-					last_contact = Instant::now(); // don't do this unless it passes peer::check
 				}
 				Err(rustix::io::Errno::INTR) | Err(rustix::io::Errno::AGAIN) => {}
 				Err(e) => error!("volume {:?}: accept failed: {e}", l.volume.name),
