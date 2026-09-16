@@ -397,36 +397,63 @@ fn absorb(
 	Ok(())
 }
 
+/// Unpack a TPM2_PCR_Read response into the PCRs it answered for and their
+/// digests.
+///
+/// Three fields (Part 3, 22.4.2): a UINT32 pcrUpdateCounter, a
+/// TPML_PCR_SELECTION naming *which* PCRs were read, and a TPML_DIGEST holding
+/// their values. The two lists are positional -- a digest carries no PCR index
+/// of its own -- and the TPM fills the digest list in ascending PCR order, so
+/// the only way to pair them up is to walk the selection bitmap in that same
+/// order. `read_pcrs` always asks for exactly one bank, so refusing any other
+/// selection count keeps that order unambiguous.
+///
+/// The two lists are not checked against each other here; `absorb` does that,
+/// where the outstanding PCRs are also in scope.
 fn parse_pcr_read(payload: &[u8]) -> Result<PcrRead, String> {
 	let mut r = Reader::new(payload);
 	let _update_counter = r.u32()?;
 
 	let selections = r.u32()?;
+	if selections != 1 {
+		return Err(format!(
+			"the TPM answered with {selections} PCR selection(s), expected 1"
+		));
+	}
+
+	// TPMS_PCR_SELECTION: the bank, a sizeofSelect byte, then that many bitmap
+	// bytes, bit-ordered as put_pcr_selection writes them -- PCR n is byte n/8,
+	// bit n%8. sizeofSelect being a byte means a TPM could describe 2040
+	// registers; only 0..=23 exist, and narrowing a higher index to u8 would
+	// wrap it onto a real PCR, so anything past 23 is refused outright.
+	let _hash = r.u16()?;
+	let size = r.u8()? as usize;
+	let bitmap = r.bytes(size)?;
 	let mut returned = Vec::new();
-	for _ in 0..selections {
-		let _hash = r.u16()?;
-		let size = r.u8()? as usize;
-		let bitmap = r.bytes(size)?;
-		for (byte, bits) in bitmap.iter().enumerate() {
-			for bit in 0..8 {
-				if bits & (1 << bit) != 0 {
-					let pcr = byte * 8 + bit;
-					if pcr > 23 {
-						return Err(format!("PCR {pcr} is out of range"));
-					}
-					returned.push(pcr as u8);
+	for (byte, bits) in bitmap.iter().enumerate() {
+		for bit in 0..8 {
+			if bits & (1 << bit) != 0 {
+				let pcr = byte * 8 + bit;
+				if pcr > 23 {
+					return Err(format!("PCR {pcr} is out of range"));
 				}
+				returned.push(pcr as u8);
 			}
 		}
 	}
 
+	// TPML_DIGEST: a count, then that many TPM2B_DIGEST. The count is the TPM's
+	// unvalidated word, so the reservation is clamped: a TPM2B cannot be
+	// smaller than its own two-byte size prefix, which caps the digests any
+	// remaining payload could hold at half its length. Without that, a count of
+	// 0xffffffff would ask the allocator for tens of gigabytes before the loop
+	// fell over on the first short read.
 	let count = r.u32()?;
-	let mut digests = Vec::with_capacity(count as usize); // TODO: clamp to remaining payload length
+	let mut digests = Vec::with_capacity((count as usize).min(r.remaining() / 2));
 	for _ in 0..count {
 		digests.push(r.tpm2b()?.to_vec());
 	}
 
-	returned.sort_unstable();
 	Ok((returned, digests))
 }
 
@@ -470,6 +497,10 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
 	fn new(buf: &'a [u8]) -> Self {
 		Reader { buf, at: 0 }
+	}
+
+	fn remaining(&self) -> usize {
+		self.buf.len() - self.at
 	}
 
 	fn bytes(&mut self, n: usize) -> Result<&'a [u8], String> {
@@ -737,6 +768,46 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn an_overstated_digest_count_is_refused() {
+		// Reserving for the TPM's count unclamped used to hand the allocator a
+		// 0xffffffff-element request and abort the process before the read
+		// failed.
+		let mut payload = Vec::new();
+		put_u32(&mut payload, 0);
+		put_pcr_selection(&mut payload, Bank::SHA256, &[7]);
+		put_u32(&mut payload, u32::MAX);
+		put_tpm2b(&mut payload, &[0xaa; 32]);
+
+		let actual = parse_pcr_read(&payload);
+		assert!(
+			actual.is_err(),
+			"parse_pcr_read(<count u32::MAX, one digest>) returned {actual:?}, expected Err"
+		);
+	}
+
+	#[test]
+	fn more_than_one_pcr_selection_is_refused() {
+		// Digests are positional across the whole selection list, so a second
+		// selection would pair them with the wrong PCRs.
+		let mut payload = Vec::new();
+		put_u32(&mut payload, 0);
+		put_u32(&mut payload, 2);
+		for bank in [Bank::SHA256, Bank(0x0004)] {
+			put_u16(&mut payload, bank.0);
+			payload.push(3);
+			payload.extend_from_slice(&[0x80, 0x00, 0x00]);
+		}
+		put_u32(&mut payload, 2);
+		put_tpm2b(&mut payload, &[0xaa; 32]);
+		put_tpm2b(&mut payload, &[0xbb; 20]);
+
+		let actual = parse_pcr_read(&payload);
+		assert!(
+			actual.is_err(),
+			"parse_pcr_read(<two selections>) returned {actual:?}, expected Err"
+		);
+	}
 	#[test]
 	fn a_reader_stops_at_the_end() {
 		let mut r = Reader::new(&[0x00, 0x01]);
