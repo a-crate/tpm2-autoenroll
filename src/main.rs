@@ -89,8 +89,20 @@ static TERMINATE: AtomicBool = AtomicBool::new(false);
 /// Every path defaults to what a NixOS system uses; the overrides exist so the
 /// daemon can be driven by hand.
 struct Args {
+	mode: Mode,
 	config: String,
 	socket_dir: String,
+}
+
+/// `check-config` validates a config file and exits, touching no device, TPM or
+/// socket. The Nix module runs it over the file it generates: the volume
+/// submodule there is freeform, so a key this build does not recognise reaches
+/// the file without Nix noticing, and at boot that silently costs the volume
+/// the feature. Better to fail the build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+	Serve,
+	CheckConfig,
 }
 
 fn main() -> std::process::ExitCode {
@@ -102,6 +114,10 @@ fn main() -> std::process::ExitCode {
 			return std::process::ExitCode::FAILURE;
 		}
 	};
+
+	if args.mode == Mode::CheckConfig {
+		return check_config(&args.config);
+	}
 
 	lock_memory();
 	set_undumpable();
@@ -150,23 +166,42 @@ fn main() -> std::process::ExitCode {
 
 /// `None` when the invocation only printed something and should exit.
 fn parse_args() -> Result<Option<Args>, String> {
+	let argv: Vec<String> = std::env::args().skip(1).collect();
+
+	if argv.iter().any(|a| a == "--version") {
+		let mut out = std::io::stdout();
+		let _ = writeln!(
+			out,
+			"{} {}",
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION")
+		);
+		return Ok(None);
+	}
+
+	parse_from(&argv).map(Some)
+}
+
+fn parse_from(argv: &[String]) -> Result<Args, String> {
 	let mut args = Args {
+		mode: Mode::Serve,
 		config: config::DEFAULT_PATH.to_string(),
 		socket_dir: sockets::DEFAULT_DIR.to_string(),
 	};
 
-	for arg in std::env::args().skip(1) {
-		if arg == "--version" {
-			let mut out = std::io::stdout();
-			let _ = writeln!(
-				out,
-				"{} {}",
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION")
-			);
-			return Ok(None);
+	// A leading word rather than a flag is a subcommand; there is one.
+	let flags = match argv.first() {
+		Some(first) if !first.starts_with('-') => {
+			if first != "check-config" {
+				return Err(format!("unrecognised subcommand {first:?}"));
+			}
+			args.mode = Mode::CheckConfig;
+			&argv[1..]
 		}
+		_ => argv,
+	};
 
+	for arg in flags {
 		let Some((name, value)) = arg.split_once('=') else {
 			return Err(format!("unrecognised argument {arg:?}"));
 		};
@@ -175,12 +210,57 @@ fn parse_args() -> Result<Option<Args>, String> {
 		}
 		match name {
 			"--config" => args.config = value.to_string(),
-			"--socket-dir" => args.socket_dir = value.to_string(),
+			// Nothing is bound in check-config, so accepting it would suggest
+			// this validates something about the socket directory.
+			"--socket-dir" if args.mode == Mode::Serve => args.socket_dir = value.to_string(),
+			"--socket-dir" => return Err("check-config takes only --config=".to_string()),
 			_ => return Err(format!("unrecognised argument {arg:?}")),
 		}
 	}
 
-	Ok(Some(args))
+	Ok(args)
+}
+
+/// Validate a config file and say what it amounts to.
+///
+/// Stricter than `config::load`, deliberately: the daemon drops a volume it
+/// cannot make sense of and serves the rest, because at boot that is the
+/// fail-closed answer, while here the point is to notice before anything is
+/// installed. Nothing is checked about the machine -- no device has to exist,
+/// no TPM has to answer -- so this is the same answer in a build sandbox as on
+/// the target.
+fn check_config(path: &str) -> std::process::ExitCode {
+	let loaded = match config::read(path) {
+		Ok(l) => l,
+		Err(e) => {
+			error!("{e}");
+			return std::process::ExitCode::FAILURE;
+		}
+	};
+
+	for why in &loaded.rejected {
+		error!("{path}: {why}");
+	}
+	if !loaded.rejected.is_empty() {
+		return std::process::ExitCode::FAILURE;
+	}
+
+	if loaded.volumes.is_empty() {
+		error!("{path}: no volumes, so the daemon would have nothing to serve");
+		return std::process::ExitCode::FAILURE;
+	}
+
+	for v in &loaded.volumes {
+		info!(
+			"volume {:?}: {} against PCRs {} ({}) on TPM {}",
+			v.name,
+			v.device,
+			config::pcr_list(&v.pcrs),
+			v.bank.name(),
+			v.tpm2_device
+		);
+	}
+	std::process::ExitCode::SUCCESS
 }
 
 /// Bind one socket per volume.
@@ -766,6 +846,55 @@ mod tests {
 			assert_eq!(
 				actual, expected,
 				"finished({volumes:?}, served = {answered:?}, open = {open:?}, idle = 0) returned {actual}, expected {expected}"
+			);
+		}
+	}
+
+	fn argv(args: &[&str]) -> Vec<String> {
+		args.iter().map(|a| a.to_string()).collect()
+	}
+
+	#[test]
+	fn no_arguments_means_serve_with_the_default_paths() {
+		let actual = parse_from(&[]).map(|a| (a.mode, a.config, a.socket_dir));
+		let expected = Ok((
+			Mode::Serve,
+			config::DEFAULT_PATH.to_string(),
+			sockets::DEFAULT_DIR.to_string(),
+		));
+		assert_eq!(
+			actual, expected,
+			"parse_from([]) returned {actual:?}, expected {expected:?}"
+		);
+	}
+
+	#[test]
+	fn check_config_takes_a_config_path() {
+		let actual = parse_from(&argv(&["check-config", "--config=/tmp/x.json"]))
+			.map(|a| (a.mode, a.config));
+		let expected = Ok((Mode::CheckConfig, "/tmp/x.json".to_string()));
+		assert_eq!(
+			actual, expected,
+			"parse_from([\"check-config\", \"--config=/tmp/x.json\"]) returned {actual:?}, expected {expected:?}"
+		);
+	}
+
+	#[test]
+	fn rejects_an_unknown_subcommand_or_flag() {
+		let cases: [(&[&str], &str); 4] = [
+			(&["serve"], "an unknown subcommand"),
+			(
+				&["check-config", "--socket-dir=/run/keys"],
+				"--socket-dir= with check-config",
+			),
+			(&["--frobnicate=1"], "an unknown flag"),
+			(&["--config="], "an empty path"),
+		];
+		for (args, why) in cases {
+			let actual = parse_from(&argv(args)).map(|a| a.mode);
+			assert!(
+				actual.is_err(),
+				"parse_from({args:?}) returned {actual:?}, expected Err ({why})"
 			);
 		}
 	}

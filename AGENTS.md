@@ -31,6 +31,8 @@ The VM tests use swtpm and are x86_64-linux only. `socket-core` assertion 1 (a h
 
 The daemon can be run by hand with `--config=` and `--socket-dir=` overrides (defaults: `/etc/tpm2-autoenroll/config.json`, `/run/cryptsetup-keys.d`).
 
+`tpm2-autoenrolld check-config [--config=PATH]` validates a config and exits, touching no device, TPM or socket. It is stricter than the daemon: any volume the daemon would drop, or a file with no volumes at all, exits non-zero. `nix/module.nix` runs it over the file it generates, and `nix/configcheck.nix` (`nix build .#checks.x86_64-linux.config-check`) is what holds it to that.
+
 ## Architecture
 
 The binary is `tpm2-autoenrolld`, a single-threaded daemon. It hooks into systemd-cryptsetup's key-discovery path: for each volume, systemd-cryptsetup connects to `/run/cryptsetup-keys.d/<volume>.key` if that path is a socket. The daemon binds one such socket per volume in its JSON config (`config.rs`; missing or unparseable means exit non-zero). The config is also the only source of the PCR selection and bank it enrolls with: the same fields in the LUKS2 header are unauthenticated (`cryptsetup token import` needs no key), so they are only ever compared against the config. It sends `READY=1` (`notify.rs`) only once every socket is bound.
@@ -65,7 +67,7 @@ The binary is meant to go into the initrd, so closure size shapes the code:
 
 ### NixOS module (`nix/module.nix`)
 
-Volumes are listed per stage in `services.tpm2-autoenroll.stages.<initrd|system>.volumes.<name> = { device; pcrs; tpm2_device ? "auto"; pcr_bank ? "sha256"; }`. The options are named after the JSON keys and the volume submodule is freeform (`pkgs.formats.json`), so a stage's `volumes` attrset is written out as the config's `volumes` object verbatim and an undeclared key reaches the daemon untouched — where an unrecognised one rejects that volume, costing it the feature at boot rather than failing the build. For each stage that has volumes it installs:
+Volumes are listed per stage in `services.tpm2-autoenroll.stages.<initrd|system>.volumes.<name> = { device; pcrs; tpm2_device ? "auto"; pcr_bank ? "sha256"; }`. The options are named after the JSON keys and the volume submodule is freeform (`pkgs.formats.json`), so a stage's `volumes` attrset is written out as the config's `volumes` object verbatim and an undeclared key reaches the daemon untouched. Nix therefore cannot judge the schema, so the generated file is passed through `tpm2-autoenrolld check-config` at build time and a key the daemon would reject fails the build — except on a cross build, where the binary cannot run on the builder and the check is skipped. For each stage that has volumes it installs:
 - a `Type=notify`, `DefaultDependencies=no` service ordered before `cryptsetup-pre.target`, which in the initrd also conflicts with `initrd-switch-root.target`;
 - a drop-in on the `systemd-cryptsetup@.service` template adding `Wants=`/`After=` on the daemon;
 - a config at `/etc/tpm2-autoenroll/config.json` holding only that stage's volumes (`boot.initrd.systemd.contents` or `environment.etc`).

@@ -39,7 +39,23 @@ let
 
   configPath = "/etc/tpm2-autoenroll/config.json";
 
-  configFile = volumes: format.generate "tpm2-autoenroll.json" { inherit volumes; };
+  # The daemon validates the generated file here, at build time, because the
+  # volume submodule is freeform: a key it does not recognise gets this far
+  # without Nix noticing, and at boot that costs the volume the feature while
+  # saying so only in the journal. Skipped when the build machine cannot run the
+  # binary, as on a cross build, which is then the one case where a config the
+  # daemon would refuse still reaches a boot.
+  checked =
+    file:
+    if pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform then
+      pkgs.runCommand "tpm2-autoenroll.json" { } ''
+        ${lib.getExe cfg.package} check-config --config=${file}
+        cp ${file} $out
+      ''
+    else
+      file;
+
+  configFile = volumes: checked (format.generate "tpm2-autoenroll.json" { inherit volumes; });
 
   # /run survives switch-root, and the sockets the daemon binds live there. It
   # unlinks them when it is asked to stop, so being stopped at switch-root is

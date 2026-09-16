@@ -56,14 +56,36 @@ pub struct Volume {
 	pub bank: Bank,
 }
 
-/// Every volume that passed validation. A file that cannot be read or parsed at
-/// all is an `Err`; a single bad volume costs only itself.
-pub fn load(path: &str) -> Result<Vec<Volume>, String> {
+/// What a file amounts to: the volumes that passed validation, and why each
+/// rejected one did not.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Loaded {
+	pub volumes: Vec<Volume>,
+	/// One message per rejected volume, each naming it.
+	pub rejected: Vec<String>,
+}
+
+/// Read and validate, reporting rejections rather than acting on them.
+///
+/// `check-config` refuses a file with any, which is what lets a Nix build catch
+/// a key this build does not know (see `nix/module.nix`). At boot the same key
+/// would cost that volume the feature and say so only in the journal.
+pub fn read(path: &str) -> Result<Loaded, String> {
 	let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
 	parse(&text).map_err(|e| format!("{path}: {e}"))
 }
 
-pub fn parse(text: &str) -> Result<Vec<Volume>, String> {
+/// Every volume that passed validation. A file that cannot be read or parsed at
+/// all is an `Err`; a single bad volume costs only itself.
+pub fn load(path: &str) -> Result<Vec<Volume>, String> {
+	let loaded = read(path)?;
+	for why in &loaded.rejected {
+		error!("config: {why}; it will not be served");
+	}
+	Ok(loaded.volumes)
+}
+
+pub fn parse(text: &str) -> Result<Loaded, String> {
 	let root: Value = serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
 	let obj = root.as_object().ok_or("top level is not an object")?;
 
@@ -77,11 +99,11 @@ pub fn parse(text: &str) -> Result<Vec<Volume>, String> {
 		.as_object()
 		.ok_or("\"volumes\" is not an object")?;
 
-	let mut out = Vec::with_capacity(volumes.len());
+	let mut out = Loaded::default();
 	for (name, value) in volumes {
 		match volume(name, value) {
-			Ok(v) => out.push(v),
-			Err(e) => error!("config: volume {name:?}: {e}; it will not be served"),
+			Ok(v) => out.volumes.push(v),
+			Err(e) => out.rejected.push(format!("volume {name:?}: {e}")),
 		}
 	}
 	Ok(out)
@@ -171,9 +193,13 @@ mod tests {
 	use super::*;
 
 	fn only(input: &str) -> Option<Volume> {
-		let volumes = parse(input)
+		let loaded = parse(input)
 			.unwrap_or_else(|e| panic!("parse({input:?}) returned Err({e}), expected Ok"));
-		let by_name: BTreeMap<_, _> = volumes.into_iter().map(|v| (v.name.clone(), v)).collect();
+		let by_name: BTreeMap<_, _> = loaded
+			.volumes
+			.into_iter()
+			.map(|v| (v.name.clone(), v))
+			.collect();
 		by_name.get("root").cloned()
 	}
 
@@ -264,11 +290,8 @@ mod tests {
 			"bad": {"device": "/dev/vdb", "pcrs": [7], "extra": true},
 			"root": {"device": "/dev/vda2", "pcrs": [7]}
 		}}"#;
-		let actual: Vec<String> = parse(input)
-			.expect("parse returned Err, expected Ok")
-			.into_iter()
-			.map(|v| v.name)
-			.collect();
+		let loaded = parse(input).expect("parse returned Err, expected Ok");
+		let actual: Vec<String> = loaded.volumes.into_iter().map(|v| v.name).collect();
 		assert_eq!(
 			actual,
 			vec!["root".to_string()],
@@ -277,11 +300,32 @@ mod tests {
 	}
 
 	#[test]
+	fn a_rejected_volume_is_reported_rather_than_only_dropped() {
+		// What check-config refuses over: at boot this volume would just be
+		// dropped, and the only sign would be a journal line.
+		let input = r#"{"volumes":{"root":{"device":"/dev/vda2","pcrs":[7],"extra":true}}}"#;
+		let actual = parse(input)
+			.expect("parse returned Err, expected Ok")
+			.rejected;
+		assert_eq!(
+			actual.len(),
+			1,
+			"parse({input:?}) returned rejected {actual:?}, expected one entry"
+		);
+		assert!(
+			actual[0].contains("root") && actual[0].contains("extra"),
+			"parse({input:?}) returned rejected {actual:?}, expected it to name the volume and the key"
+		);
+	}
+
+	#[test]
 	fn rejects_unusable_volume_names() {
 		for name in ["", "a/b", ".", ".."] {
 			let input =
 				format!(r#"{{"volumes":{{"{name}":{{"device":"/dev/vda2","pcrs":[7]}}}}}}"#);
-			let actual = parse(&input).expect("parse returned Err, expected Ok");
+			let actual = parse(&input)
+				.expect("parse returned Err, expected Ok")
+				.volumes;
 			assert!(
 				actual.is_empty(),
 				"parse({input:?}) returned {actual:?}, expected the volume named {name:?} to be rejected"

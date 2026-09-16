@@ -67,6 +67,15 @@
         {
           inherit (self.packages.${system}) tpm2-autoenrolld;
         }
+        # Runs the binary it just built, so only where the builder can execute
+        # it. Cheap enough not to be worth a platform restriction beyond that.
+        // nixpkgs.lib.optionalAttrs
+          (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform)
+          {
+            config-check = pkgs.callPackage ./nix/configcheck.nix {
+              tpm2-autoenrolld = self.packages.${system}.tpm2-autoenrolld;
+            };
+          }
         # The VM test needs swtpm and a qemu the test framework knows how to
         # drive; keep it to the one platform that is actually exercised.
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
