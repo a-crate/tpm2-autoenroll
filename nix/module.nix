@@ -67,8 +67,9 @@ let
   # config.systemd.package -- so this is usually a single extra build.
   packageFor =
     systemdPackage:
-    cfg.package.overrideAttrs {
-      TPM2_AUTOENROLL_SYSTEMD_CRYPTSETUP = "${systemdPackage}/bin/systemd-cryptsetup";
+    import ./expected-peer.nix {
+      package = cfg.package;
+      inherit systemdPackage;
     };
 
   # /run survives switch-root, and the sockets the daemon binds live there. It

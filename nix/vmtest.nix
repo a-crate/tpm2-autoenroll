@@ -130,8 +130,9 @@ pkgs.testers.runNixOSTest {
           # this fails quietly in the shape of a refused passphrase, so the plain
           # phase subtests below are what covers it.
           ExecStart = lib.getExe (
-            tpm2-autoenrolld.overrideAttrs {
-              TPM2_AUTOENROLL_SYSTEMD_CRYPTSETUP = "${config.systemd.package}/bin/systemd-cryptsetup";
+            import ./expected-peer.nix {
+              package = tpm2-autoenrolld;
+              systemdPackage = config.systemd.package;
             }
           );
           SystemCallFilter = "@system-service";
