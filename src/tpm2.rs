@@ -421,7 +421,7 @@ fn parse_pcr_read(payload: &[u8]) -> Result<PcrRead, String> {
 	}
 
 	let count = r.u32()?;
-	let mut digests = Vec::with_capacity(count as usize);
+	let mut digests = Vec::with_capacity(count as usize); // TODO: clamp to remaining payload length
 	for _ in 0..count {
 		digests.push(r.tpm2b()?.to_vec());
 	}

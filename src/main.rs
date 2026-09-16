@@ -348,6 +348,8 @@ fn set_undumpable() {
 			std::io::Error::last_os_error()
 		);
 	}
+	// TODO: this doesn't survive exec, which we do several times :(
+	// need to stop doing that
 }
 
 fn unix_addr(addr: &SocketAddrAny) -> Option<SocketAddrUnix> {
@@ -415,7 +417,7 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 					if handle(conn, &l.volume, &mut cache, &mut decided) {
 						served.insert(l.volume.name.clone());
 					}
-					last_contact = Instant::now();
+					last_contact = Instant::now(); // don't do this unless it passes peer::check
 				}
 				Err(rustix::io::Errno::INTR) | Err(rustix::io::Errno::AGAIN) => {}
 				Err(e) => error!("volume {:?}: accept failed: {e}", l.volume.name),

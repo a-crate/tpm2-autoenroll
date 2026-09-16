@@ -12,6 +12,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 /// `Ok` when the peer of `conn` is systemd-cryptsetup working on `volume`.
 pub fn check(conn: &OwnedFd, volume: &str) -> Result<(), String> {
+    // This is probably forge-able by full root :(
+    // mkdir /sys/fs/cgroup/evil/systemd-cryptsetup@root.service
+    // write pid to croup.procs
+    // TODO: I don't know. check /proc/<pid>/exe I guess, which is still forgeable
+    // but hopefully less so
 	let cred =
 		rustix::net::sockopt::socket_peercred(conn).map_err(|e| format!("SO_PEERCRED: {e}"))?;
 	if cred.uid.as_raw() != 0 {

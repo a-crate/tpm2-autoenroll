@@ -113,6 +113,7 @@ let
       RestrictRealtime = true;
       RestrictSUIDSGID = true;
       UMask = "0077";
+      # TODO: SystemCallFilter=@system-service and MemoryDenyWriteExecute=yes
       # libcryptsetup can decrypt keyslots through AF_ALG and talks to udev and
       # device-mapper over netlink; everything else is AF_UNIX.
       RestrictAddressFamilies = [
