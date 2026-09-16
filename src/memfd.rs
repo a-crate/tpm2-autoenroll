@@ -11,6 +11,8 @@
 //! terminate a key file -- so what the child reads is exactly the bytes
 //! systemd-cryptsetup would have received from us.
 
+// probably sniffable by real root anyway since we pass this to a child process
+
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::process::Command;
