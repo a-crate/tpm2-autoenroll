@@ -10,8 +10,8 @@ If it fails, it will fall through to attempting to discover keys. It will discov
 tpm2-autoenroll will prompt you for a password, and verify it against the device.
 tpm2-autoenroll with then prompt you for a re-enrollment decision. There are three options:
 1. Yes - enroll this PCR state for this device
-2. Always - enroll this PCR state for this device, and remember this decision for futures devices with identical PCR state
-3. No - do not enroll this PCR state for any device
+2. Always - enroll this PCR state for this device, and remember this decision for future devices with identical PCR state this run
+3. No - do not enroll this PCR state for any device this run
 
 Regardless of your choice, your password will be passed back to systemd to unlock the disk.
 Boot continues as normal.
@@ -24,7 +24,7 @@ The unit should:
 1. Set `DefaultDependencies=no` and `Type=notify`
 2. Run before and conflict with `initrd-switch-root` and `shutdown` targets.
 3. Run before `cryptsetup-pre.target` 
-4. Run before and be wanted by `systemd-cryptsetup@$VOLUME.service` for each volume.
+4. Run before and be wanted by `systemd-cryptsetup@$VOLUME.service` for each volume. This can be done with a `system-cryptsetup@.service` drop in.
 
 `cryptsetup`, `systemd-cryptenroll`, and `systemd-ask-password` must be in `$PATH`.
 
@@ -32,16 +32,28 @@ TODO: write a dracut module, maybe.
 
 ## Configuration
 
-Most users should not require any configuration.
-On start, tpm2-autoenroll will find disks configured to unlock with tpm in `/etc/crypttab`.
-The TPM device will be detected from `/etc/crypttab`.
-The PCRs will be detected from the `systemd-tpm2` token data.
+Describe the devices to be re-enrolled in `/etc/tpm2-autoenroll/config.json`.
+Fields described below.
 
-If you want to ignore a device and never be prompted for re-enrollment, put the device name (matching crypttab) in `/etc/tpm2-autoenroll/ignore`, one per line.
+```json
+{
+  "volumes": { // (required) top-level key
+    "<name>": { // device mapper name
+      "device": "", // (required) backing device
+      "tpm2_device": "", // (default: auto) tpm2 device,
+      "pcrs": [ 0 ], // (required) PCRs, no PCRs may be >23,
+      "pcr_bank": "", // (default: sha256) pcr bank,
+    }
+  }
+}
+```
+
+You can check your current settings by running 
+`DEV=/dev/sda1 sudo cryptsetup luksDump --dump-json-metadata $DEV | jq '.tokens | to_entries[] | select(.value.type=="systemd-tpm2")'`
 
 ### NixOS
 
-A nixos module and flake is present. 
+A nixos module and flake is present.
 Flake configuration looks something like this:
 
 ```nix
@@ -79,18 +91,28 @@ And actual usage looks something like this:
         "tpm2-measure-pcr=yes"
       ];
     };
-    "swap" = {
-      device = "/dev/disk/by-uuid/abc";
-      crypttabExtraOpts = [
-        "tpm2-device=auto"
-        "tpm2-measure-pcr=yes"
-      ];
-    };
   };
+  environment.etc.crypttab = {
+      mode = "0600";
+      text = ''
+        # <volume-name> <encrypted-device> [key-file] [options]
+        swap /dev/disk/by-uuid/abc - tpm2-device=auto,tpm2-measure-pcr=yes
+      '';
+    };
   services.tpm2-autoenroll = {
     enable = true;
-    stages = [ "systemd" "initrd" ]; # Default is initrd only.
-    ignore = [ "/dev/disk/by-uuid/abc" ];
+    initrd.volumes = {
+      "root" = {
+        device = "/dev/disk/by-uuid/def";
+        pcrs = [ 0 1 7 ];
+      };
+    };
+    system.volumes = {
+      "swap" = {
+        device = "/dev/disk/by-uuid/abc";
+        pcrs = [ 0 1 7 ];
+      };
+    };
   };
 }
 ```
