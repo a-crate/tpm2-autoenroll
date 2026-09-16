@@ -129,6 +129,9 @@ Usage of this module increases your susceptibility to evil maid attacks.
 Accepting re-enrollment when you were not expecting a change in PCRs could leak your disk encryption keys to an attacker.
 However, typing in your password at all when you were not expecting a change in PCRs could leak your keys to an attacker.
 
+Also note that due to the unconstrained nature of a what's happening in a full root filesystem as compared to initrd, running this in the system stage is far more vulnerable.
+It is very difficult and near impossible to avoid being vulnerable to password sniffing in the system stage.
+
 ## AI Policy
 
 The use of AI or LLMs to wholly or partially write the following things is forbidden:
