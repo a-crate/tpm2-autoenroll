@@ -9,14 +9,22 @@
 //! reach `/run`, and this is what stops them.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::Path;
+
+/// The executable a key-socket peer has to be running.
+///
+/// Set `TPM2_AUTOENROLL_SYSTEMD_CRYPTSETUP` at build time to override it.
+pub const EXPECTED_SYSTEMD_BINARY: &str = match option_env!("TPM2_AUTOENROLL_SYSTEMD_CRYPTSETUP") {
+	Some(path) => path,
+	None => "/usr/bin/systemd-cryptsetup",
+};
 
 /// `Ok` when the peer of `conn` is systemd-cryptsetup working on `volume`.
 pub fn check(conn: &OwnedFd, volume: &str) -> Result<(), String> {
     // This is probably forge-able by full root :(
     // mkdir /sys/fs/cgroup/evil/systemd-cryptsetup@root.service
     // write pid to croup.procs
-    // TODO: I don't know. check /proc/<pid>/exe I guess, which is still forgeable
-    // but hopefully less so
+    // take over EXPECTED_SYSTEMD_BINARY
 	let cred =
 		rustix::net::sockopt::socket_peercred(conn).map_err(|e| format!("SO_PEERCRED: {e}"))?;
 	if cred.uid.as_raw() != 0 {
@@ -39,8 +47,17 @@ pub fn check(conn: &OwnedFd, volume: &str) -> Result<(), String> {
 		return Err(format!("the peer (pid {pid}) is not in {unit}"));
 	}
 
-	// The cgroup was read by pid. The pidfd still referring to a live process
-	// means that pid was not recycled while we read it.
+	let path = format!("/proc/{pid}/exe");
+	let exe = std::fs::read_link(&path).map_err(|e| format!("{path}: {e}"))?;
+	if !is_expected_exe(&exe) {
+		return Err(format!(
+			"the peer (pid {pid}) runs {}, expected {EXPECTED_SYSTEMD_BINARY}",
+			exe.display()
+		));
+	}
+
+	// The cgroup and exe were read by pid. The pidfd still referring to a live
+	// process means that pid was not recycled while we read them.
 	if let Some(fd) = &pidfd {
 		alive(fd)?;
 	}
@@ -105,6 +122,11 @@ fn alive(fd: &OwnedFd) -> Result<(), String> {
 		));
 	}
 	Ok(())
+}
+
+/// Whether a `/proc/<pid>/exe` link target is the binary we expect.
+fn is_expected_exe(link: &Path) -> bool {
+	link == Path::new(EXPECTED_SYSTEMD_BINARY)
 }
 
 /// Whether the unified-hierarchy line of a `/proc/<pid>/cgroup` ends in `unit`.
@@ -179,6 +201,35 @@ mod tests {
 			assert_eq!(
 				actual, expected,
 				"in_unit({cgroup:?}, {unit:?}) returned {actual}, expected {expected}"
+			);
+		}
+	}
+
+	#[test]
+	fn the_expected_binary_is_an_absolute_path() {
+		// /proc/<pid>/exe is always absolute, so a relative override could never
+		// match and would cost the feature at boot with a confusing reason.
+		let actual = Path::new(EXPECTED_SYSTEMD_BINARY).is_absolute();
+		assert!(
+			actual,
+			"Path::new({EXPECTED_SYSTEMD_BINARY:?}).is_absolute() returned {actual}, expected true"
+		);
+	}
+
+	#[test]
+	fn matches_only_the_expected_binary() {
+		let cases = [
+			(EXPECTED_SYSTEMD_BINARY.to_string(), true),
+			(format!("{EXPECTED_SYSTEMD_BINARY} (deleted)"), false),
+			(format!("{EXPECTED_SYSTEMD_BINARY}-generator"), false),
+			("/usr/bin/systemd-cryptenroll".to_string(), false),
+			("/tmp/evil".to_string(), false),
+		];
+		for (link, expected) in cases {
+			let actual = is_expected_exe(Path::new(&link));
+			assert_eq!(
+				actual, expected,
+				"is_expected_exe({link:?}) returned {actual}, expected {expected}"
 			);
 		}
 	}

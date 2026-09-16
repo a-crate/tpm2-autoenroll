@@ -57,6 +57,20 @@ let
 
   configFile = volumes: checked (format.generate "tpm2-autoenroll.json" { inherit volumes; });
 
+  # The daemon refuses to hand a passphrase to a peer whose /proc/<pid>/exe is
+  # not the systemd-cryptsetup it was built expecting (src/peer.rs). That path
+  # is baked in at compile time because there is nothing trustworthy to read it
+  # from at runtime, and its built-in default is the /usr/bin location a
+  # conventional distribution uses, which no NixOS system has. So the package
+  # is rebuilt per stage against the systemd that stage actually runs. Both
+  # stages normally share one -- boot.initrd.systemd.package defaults to
+  # config.systemd.package -- so this is usually a single extra build.
+  packageFor =
+    systemdPackage:
+    cfg.package.overrideAttrs {
+      TPM2_AUTOENROLL_SYSTEMD_CRYPTSETUP = "${systemdPackage}/bin/systemd-cryptsetup";
+    };
+
   # /run survives switch-root, and the sockets the daemon binds live there. It
   # unlinks them when it is asked to stop, so being stopped at switch-root is
   # what keeps a dead socket out of stage 2's key-discovery path. Only
@@ -100,7 +114,7 @@ let
       # useful. The daemon notifies once every socket is listening.
       Type = "notify";
       NotifyAccess = "main";
-      ExecStart = "${lib.getExe cfg.package} --config=${configPath}";
+      ExecStart = "${lib.getExe (packageFor systemdPackage)} --config=${configPath}";
       LimitCORE = "0";
 
       # Sandboxing that takes nothing the daemon uses. It needs block devices,
@@ -385,7 +399,7 @@ in
         # systemd or cryptsetup. This is also why the daemon is unwrapped -- a
         # PATH wrapper would put both packages back in its own closure.
         storePaths = [
-          cfg.package
+          (packageFor systemdPackage)
           "${systemdPackage}/bin/systemd-ask-password"
           "${systemdPackage}/bin/systemd-cryptenroll"
           "${cfg.cryptsetupPackage}/bin/cryptsetup"

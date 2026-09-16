@@ -49,80 +49,96 @@ in
 pkgs.testers.runNixOSTest {
   name = "tpm2-autoenroll-socket-core";
 
-  nodes.machine = { lib, pkgs, ... }: {
-    virtualisation.tpm.enable = true;
-    virtualisation.emptyDiskImages = [
-      512
-      512
-      512
-      512
-    ];
-    virtualisation.memorySize = 2048;
-
-    environment.systemPackages = [
-      pkgs.cryptsetup
-      pkgs.tpm2-tools
-      tpm2-autoenrolld
-      answerPassphrase
-    ];
-
-    # Field 3 is "-": no key file configured, which is what makes
-    # systemd-cryptsetup set try_discover_key and consult our socket
-    # (cryptsetup.c:2712). A path here instead would force the key-file branch
-    # and the header token would never be read -- DESIGN.md section 2.2.
-    #
-    # noauto keeps the unlock under the test's control rather than boot ordering.
-    environment.etc.crypttab.text = lib.concatMapStrings (line: line + "\n") (
-      lib.mapAttrsToList (volume: device: "${volume} ${device} - noauto,tpm2-device=auto") volumes
-    );
-
-    # The crypttab drives systemd-cryptsetup; this drives the daemon, which
-    # binds one socket per volume itself, including creating
-    # /run/cryptsetup-keys.d.
-    environment.etc."tpm2-autoenroll/config.json".text = builtins.toJSON {
-      volumes = lib.mapAttrs (_: device: {
-        inherit device;
-        pcrs = [ 16 ];
-      }) volumes;
-    };
-
-    # The same Wants=/After= drop-in the module installs: the daemon exits once
-    # it has served every volume, and this is what brings it back for the next
-    # unlock. The test still drives the cryptsetup units by hand.
-    systemd.units."systemd-cryptsetup@.service" = {
-      overrideStrategy = "asDropin";
-      text = ''
-        [Unit]
-        Wants=tpm2-autoenrolld.service
-        After=tpm2-autoenrolld.service
-      '';
-    };
-
-    systemd.services.tpm2-autoenrolld = {
-      description = "TPM2 auto-enrollment key agent";
-      before = [ "cryptsetup-pre.target" ];
-      unitConfig.DefaultDependencies = "no";
-      # The package carries no PATH of its own, so the caller names the three
-      # binaries the daemon shells out to -- systemd-ask-password,
-      # systemd-cryptenroll and cryptsetup. Leaving cryptsetup off is a quiet
-      # failure rather than a loud one: passphrase validation would fail for
-      # every candidate and the daemon would decline every volume, which looks
-      # from the outside like a wrong passphrase.
-      path = [
-        pkgs.systemd
-        pkgs.cryptsetup
+  nodes.machine =
+    {
+      config,
+      lib,
+      pkgs,
+      ...
+    }:
+    {
+      virtualisation.tpm.enable = true;
+      virtualisation.emptyDiskImages = [
+        512
+        512
+        512
+        512
       ];
-      serviceConfig = {
-        # Type=notify: the daemon says so once every socket is listening, which
-        # is what makes "before cryptsetup" mean anything.
-        Type = "notify";
-        NotifyAccess = "main";
-        ExecStart = lib.getExe tpm2-autoenrolld;
-        SystemCallFilter = "@system-service";
-        MemoryDenyWriteExecute = "yes";
+      virtualisation.memorySize = 2048;
+
+      environment.systemPackages = [
+        pkgs.cryptsetup
+        pkgs.tpm2-tools
+        tpm2-autoenrolld
+        answerPassphrase
+      ];
+
+      # Field 3 is "-": no key file configured, which is what makes
+      # systemd-cryptsetup set try_discover_key and consult our socket
+      # (cryptsetup.c:2712). A path here instead would force the key-file branch
+      # and the header token would never be read -- DESIGN.md section 2.2.
+      #
+      # noauto keeps the unlock under the test's control rather than boot ordering.
+      environment.etc.crypttab.text = lib.concatMapStrings (line: line + "\n") (
+        lib.mapAttrsToList (volume: device: "${volume} ${device} - noauto,tpm2-device=auto") volumes
+      );
+
+      # The crypttab drives systemd-cryptsetup; this drives the daemon, which
+      # binds one socket per volume itself, including creating
+      # /run/cryptsetup-keys.d.
+      environment.etc."tpm2-autoenroll/config.json".text = builtins.toJSON {
+        volumes = lib.mapAttrs (_: device: {
+          inherit device;
+          pcrs = [ 16 ];
+        }) volumes;
+      };
+
+      # The same Wants=/After= drop-in the module installs: the daemon exits once
+      # it has served every volume, and this is what brings it back for the next
+      # unlock. The test still drives the cryptsetup units by hand.
+      systemd.units."systemd-cryptsetup@.service" = {
+        overrideStrategy = "asDropin";
+        text = ''
+          [Unit]
+          Wants=tpm2-autoenrolld.service
+          After=tpm2-autoenrolld.service
+        '';
+      };
+
+      systemd.services.tpm2-autoenrolld = {
+        description = "TPM2 auto-enrollment key agent";
+        before = [ "cryptsetup-pre.target" ];
+        unitConfig.DefaultDependencies = "no";
+        # The package carries no PATH of its own, so the caller names the three
+        # binaries the daemon shells out to -- systemd-ask-password,
+        # systemd-cryptenroll and cryptsetup. Leaving cryptsetup off is a quiet
+        # failure rather than a loud one: passphrase validation would fail for
+        # every candidate and the daemon would decline every volume, which looks
+        # from the outside like a wrong passphrase.
+        path = [
+          pkgs.systemd
+          pkgs.cryptsetup
+        ];
+        serviceConfig = {
+          # Type=notify: the daemon says so once every socket is listening, which
+          # is what makes "before cryptsetup" mean anything.
+          Type = "notify";
+          NotifyAccess = "main";
+          # Rebuilt against this machine's systemd, because the daemon compares
+          # the peer's /proc/<pid>/exe with a path fixed at compile time and its
+          # built-in default is the /usr/bin one no NixOS system has. Skipping
+          # this fails quietly in the shape of a refused passphrase, so the plain
+          # phase subtests below are what covers it.
+          ExecStart = lib.getExe (
+            tpm2-autoenrolld.overrideAttrs {
+              TPM2_AUTOENROLL_SYSTEMD_CRYPTSETUP = "${config.systemd.package}/bin/systemd-cryptsetup";
+            }
+          );
+          SystemCallFilter = "@system-service";
+          MemoryDenyWriteExecute = "yes";
+        };
       };
     };
-  };
 
   # Two routes reach a TPM2 unlock, and which one runs depends on whether
   # libcryptsetup's external token plugin is installed:
