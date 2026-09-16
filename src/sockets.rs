@@ -63,7 +63,11 @@ fn check_existing(dir: &str, owner: u32) -> Result<(), String> {
 }
 
 pub fn bind(path: &str) -> Result<OwnedFd, String> {
-	clear(path)?;
+	if clear(path)? == Cleared::Kept {
+		return Err(format!(
+			"{path} exists and is not a socket; leaving it alone"
+		));
+	}
 
 	let addr = SocketAddrUnix::new(path).map_err(|e| format!("{path}: {e}"))?;
 	let fd = rustix::net::socket_with(
@@ -82,23 +86,37 @@ pub fn bind(path: &str) -> Result<OwnedFd, String> {
 	Ok(fd)
 }
 
+/// What was at the path before `clear` ran.
+///
+/// Kept apart because the callers want different things from them: binding
+/// cannot proceed over someone else's key file, while tidying up after a dead
+/// daemon has nothing to do about one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleared {
+	/// Nothing was there.
+	Absent,
+	/// Our socket, now unlinked.
+	Removed,
+	/// Not a socket, so not ours. Left in place.
+	Kept,
+}
+
 /// Only ever a socket. Anything else at that path is a real key file someone put
 /// there deliberately -- systemd-cryptsetup reads those too -- and deleting it
 /// would destroy the very thing it is looking for.
-pub fn clear(path: &str) -> Result<(), String> {
+pub fn clear(path: &str) -> Result<Cleared, String> {
 	let stat = match rustix::fs::lstat(path) {
 		Ok(s) => s,
-		Err(rustix::io::Errno::NOENT) => return Ok(()),
+		Err(rustix::io::Errno::NOENT) => return Ok(Cleared::Absent),
 		Err(e) => return Err(format!("stat {path}: {e}")),
 	};
 
 	if FileType::from_raw_mode(stat.st_mode as u32) != FileType::Socket {
-		return Err(format!(
-			"{path} exists and is not a socket; leaving it alone"
-		));
+		return Ok(Cleared::Kept);
 	}
 
-	rustix::fs::unlink(path).map_err(|e| format!("unlink {path}: {e}"))
+	rustix::fs::unlink(path).map_err(|e| format!("unlink {path}: {e}"))?;
+	Ok(Cleared::Removed)
 }
 
 #[cfg(test)]
@@ -137,11 +155,25 @@ mod tests {
 		drop(fd);
 		bind(&p).unwrap_or_else(|e| panic!("rebinding {p:?} returned Err({e}), expected Ok"));
 
-		clear(&p).expect("clear returned Err, expected Ok");
-		let actual = std::fs::metadata(&p).is_err();
-		assert!(
+		let actual = clear(&p);
+		assert_eq!(
 			actual,
+			Ok(Cleared::Removed),
+			"clear({p:?}) on our own socket returned {actual:?}, expected Ok(Removed)"
+		);
+		let gone = std::fs::metadata(&p).is_err();
+		assert!(
+			gone,
 			"clear({p:?}) left the socket in place, expected it gone"
+		);
+
+		// What ExecStopPost= does on a daemon that already tidied up after
+		// itself: nothing to remove is the ordinary case, not a failure.
+		let actual = clear(&p);
+		assert_eq!(
+			actual,
+			Ok(Cleared::Absent),
+			"clear({p:?}) with nothing there returned {actual:?}, expected Ok(Absent)"
 		);
 
 		let _ = std::fs::remove_dir_all(&dir);
@@ -196,13 +228,26 @@ mod tests {
 		std::fs::write(&p, b"a real key").expect("could not write the test key file");
 
 		let actual = clear(&p);
-		assert!(
-			actual.is_err(),
-			"clear({p:?}) on a regular file returned {actual:?}, expected Err: it may be someone's key file"
+		assert_eq!(
+			actual,
+			Ok(Cleared::Kept),
+			"clear({p:?}) on a regular file returned {actual:?}, expected Ok(Kept): it may be someone's key file"
 		);
 		assert!(
 			std::fs::metadata(&p).is_ok(),
 			"clear({p:?}) on a regular file deleted it, expected it left in place"
+		);
+
+		// Kept is not an error for the tidy-up path, but it is for this one:
+		// there is nowhere to bind without destroying that file.
+		let actual = bind(&p);
+		assert!(
+			actual.is_err(),
+			"bind({p:?}) over a regular file returned Ok, expected Err"
+		);
+		assert!(
+			std::fs::metadata(&p).is_ok(),
+			"bind({p:?}) over a regular file deleted it, expected it left in place"
 		);
 
 		let _ = std::fs::remove_dir_all(&dir);

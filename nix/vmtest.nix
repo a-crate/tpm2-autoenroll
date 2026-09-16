@@ -26,6 +26,13 @@
 #      starts it again.
 #   8. A root process outside the volume's systemd-cryptsetup@ unit gets
 #      nothing, even when it binds the plain-phase name.
+#   9. A daemon killed outright still has its sockets removed, by the same
+#      ExecStopPost= the module installs. This one is not a nicety: a socket
+#      with no listener behind it is not a fall back to stock behaviour, since
+#      find_key_file() turns the refused connect into a fatal error and the
+#      volume then fails to unlock without anyone being asked for a passphrase.
+#      The cleanup only ever unlinks sockets, so a real key file sharing the
+#      directory survives it.
 #
 # PCR 16 is the debug PCR: extendable from userspace, which lets us manufacture
 # the policy mismatch in place. No reboot and no boot loader, so the test is
@@ -135,6 +142,10 @@ pkgs.testers.runNixOSTest {
               systemdPackage = config.systemd.package;
             }
           );
+          # The same cleanup the module installs, because a SIGKILLed daemon
+          # leaves its sockets and a socket with nobody behind it fails the
+          # unlock outright rather than falling back (assertion 9).
+          ExecStopPost = "${lib.getExe tpm2-autoenrolld} clear-sockets";
           SystemCallFilter = "@system-service";
           MemoryDenyWriteExecute = "yes";
         };
@@ -894,5 +905,51 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl stop tpm2-autoenrolld.service")
         for volume in (VOLUME, VOLUME2, VOLUME3):
             machine.fail(f"test -e /run/cryptsetup-keys.d/{volume}.key")
+
+    with subtest("a killed daemon still has its sockets taken out of the way"):
+        # The case the daemon cannot handle itself. Serving one connection runs
+        # to minutes -- three prompts, a KDF pass per candidate, then consent and
+        # enrollment -- so a stop asked for during one can reach the unit's stop
+        # timeout, and then systemd sends SIGKILL and nothing in the daemon runs
+        # again. ExecStopPost= is what covers that, and it matters because a
+        # leftover socket is not a fall back to stock behaviour: the connect
+        # gets ECONNREFUSED and find_key_file() hands that to its caller as a
+        # fatal error, so the volume fails to unlock without anyone being asked.
+        machine.succeed("systemctl start tpm2-autoenrolld.service")
+        for volume in (VOLUME, VOLUME2, VOLUME3):
+            machine.succeed(f"test -S /run/cryptsetup-keys.d/{volume}.key")
+
+        # --kill-whom=main, not the default all: systemd reaches ExecStopPost=
+        # only after the SIGKILL phase of a stop has finished, so this is the
+        # shape of the case that matters. A whole-cgroup kill is the one thing
+        # ExecStopPost= cannot survive, since it runs in that cgroup too --
+        # `systemctl kill` without --kill-whom takes the control process with
+        # it. The terminating() checks are what keep the stop timeout from
+        # being reached in the first place.
+        machine.succeed(
+            "systemctl kill --kill-whom=main --signal=SIGKILL tpm2-autoenrolld.service"
+        )
+        machine.wait_until_fails("systemctl is-active --quiet tpm2-autoenrolld.service")
+        for volume in (VOLUME, VOLUME2, VOLUME3):
+            machine.wait_until_fails(f"test -e /run/cryptsetup-keys.d/{volume}.key")
+
+    with subtest("clearing sockets leaves a real key file where it is"):
+        # systemd-cryptsetup reads actual key files out of this directory, so
+        # the cleanup has to be able to run over one without destroying it --
+        # deleting it would remove the very thing the unlock is looking for.
+        machine.succeed(
+            "echo -n realkey > /run/cryptsetup-keys.d/notours.key",
+            "chmod 600 /run/cryptsetup-keys.d/notours.key",
+        )
+        machine.succeed(
+            "echo '{\"volumes\": {\"notours\": {\"device\": \"/dev/null\", \"pcrs\": [7]}}}'"
+            " > /run/notours.json"
+        )
+        machine.succeed("tpm2-autoenrolld clear-sockets --config=/run/notours.json")
+        actual = machine.succeed("cat /run/cryptsetup-keys.d/notours.key")
+        assert actual == "realkey", (
+            "clear-sockets over a directory holding a regular key file left "
+            f"{actual!r} in it, expected 'realkey': it must only ever unlink sockets"
+        )
   '';
 }

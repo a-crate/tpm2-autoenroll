@@ -81,75 +81,92 @@ let
     "shutdown.target"
   ];
 
-  serviceUnit = initrd: systemdPackage: {
-    description = "TPM2 auto-enrollment key agent";
+  serviceUnit =
+    initrd: systemdPackage:
+    let
+      daemon = lib.getExe (packageFor systemdPackage);
+    in
+    {
+      description = "TPM2 auto-enrollment key agent";
 
-    # Nothing here may acquire the ordinary boot dependencies: this has to be
-    # listening before the volumes it serves are unlocked, which in the initrd
-    # is long before sysinit.target.
-    unitConfig.DefaultDependencies = "no";
+      # Nothing here may acquire the ordinary boot dependencies: this has to be
+      # listening before the volumes it serves are unlocked, which in the initrd
+      # is long before sysinit.target.
+      unitConfig.DefaultDependencies = "no";
 
-    before = [
-      "cryptsetup-pre.target"
-      "cryptsetup.target"
-    ]
-    ++ lib.optionals initrd teardown;
-    conflicts = lib.optionals initrd teardown;
+      before = [
+        "cryptsetup-pre.target"
+        "cryptsetup.target"
+      ]
+      ++ lib.optionals initrd teardown;
+      conflicts = lib.optionals initrd teardown;
 
-    # The daemon shells out to systemd-ask-password, systemd-cryptenroll and
-    # cryptsetup, and which systemd those come from differs by stage -- the
-    # initrd's is boot.initrd.systemd.package. Stage 1 units get no default PATH
-    # at all, so naming them is required there rather than merely tidy. The
-    # package deliberately carries no PATH of its own so that this decision
-    # belongs to the one place that knows the stage.
-    path = [
-      systemdPackage
-      cfg.cryptsetupPackage
-    ];
-
-    serviceConfig = {
-      # Type=notify is load-bearing rather than decorative. Under Type=exec
-      # systemd would call the service started as soon as the binary was
-      # executed, which is before it has read its config or bound anything, so
-      # the After= in the drop-in below would order the unlock against nothing
-      # useful. The daemon notifies once every socket is listening.
-      Type = "notify";
-      NotifyAccess = "main";
-      ExecStart = "${lib.getExe (packageFor systemdPackage)} --config=${configPath}";
-      LimitCORE = "0";
-
-      # Sandboxing that takes nothing the daemon uses. It needs block devices,
-      # the TPM and its sockets in /run, so nothing here restricts devices or
-      # /run: not PrivateDevices or DevicePolicy, and not ProtectClock either,
-      # which implies a DeviceAllow= list and so closes off every other device.
-      NoNewPrivileges = true;
-      LockPersonality = true;
-      SystemCallArchitectures = "native";
-      RestrictRealtime = true;
-      RestrictSUIDSGID = true;
-      SystemCallFilter = "@system-service";
-      MemoryDenyWriteExecute = "yes";
-      UMask = "0077";
-      # libcryptsetup can decrypt keyslots through AF_ALG and talks to udev and
-      # device-mapper over netlink; everything else is AF_UNIX.
-      RestrictAddressFamilies = [
-        "AF_UNIX"
-        "AF_ALG"
-        "AF_NETLINK"
+      # The daemon shells out to systemd-ask-password, systemd-cryptenroll and
+      # cryptsetup, and which systemd those come from differs by stage -- the
+      # initrd's is boot.initrd.systemd.package. Stage 1 units get no default PATH
+      # at all, so naming them is required there rather than merely tidy. The
+      # package deliberately carries no PATH of its own so that this decision
+      # belongs to the one place that knows the stage.
+      path = [
+        systemdPackage
+        cfg.cryptsetupPackage
       ];
-    }
-    # Stage 2 only. No test boots the initrd, and these all rest on mount
-    # namespacing there that nothing has exercised. PrivateTmp adds no mount
-    # dependencies here: with DefaultDependencies=no it becomes "disconnected".
-    // lib.optionalAttrs (!initrd) {
-      ProtectHome = true;
-      PrivateTmp = true;
-      ProtectKernelModules = true;
-      ProtectKernelLogs = true;
-      ProtectHostname = true;
-      RestrictNamespaces = true;
+
+      serviceConfig = {
+        # Type=notify is load-bearing rather than decorative. Under Type=exec
+        # systemd would call the service started as soon as the binary was
+        # executed, which is before it has read its config or bound anything, so
+        # the After= in the drop-in below would order the unlock against nothing
+        # useful. The daemon notifies once every socket is listening.
+        Type = "notify";
+        NotifyAccess = "main";
+        ExecStart = "${daemon} --config=${configPath}";
+
+        # The daemon unlinks its sockets on the way out, but only a process that
+        # gets that far does: past the stop timeout systemd sends SIGKILL, and a
+        # connection can take minutes to serve. /run survives switch-root, and a
+        # socket with no listener behind it is not a fall back to stock
+        # behaviour -- systemd-cryptsetup's find_key_file() gets ECONNREFUSED
+        # from the connect and hands that to its caller as a fatal error, so the
+        # volume fails to unlock without anyone being prompted. ExecStopPost=
+        # runs whatever became of the main process, and clear-sockets only ever
+        # unlinks sockets, so it cannot touch a real key file left in the same
+        # directory.
+        ExecStopPost = "${daemon} clear-sockets --config=${configPath}";
+        LimitCORE = "0";
+
+        # Sandboxing that takes nothing the daemon uses. It needs block devices,
+        # the TPM and its sockets in /run, so nothing here restricts devices or
+        # /run: not PrivateDevices or DevicePolicy, and not ProtectClock either,
+        # which implies a DeviceAllow= list and so closes off every other device.
+        NoNewPrivileges = true;
+        LockPersonality = true;
+        SystemCallArchitectures = "native";
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        SystemCallFilter = "@system-service";
+        MemoryDenyWriteExecute = "yes";
+        UMask = "0077";
+        # libcryptsetup can decrypt keyslots through AF_ALG and talks to udev and
+        # device-mapper over netlink; everything else is AF_UNIX.
+        RestrictAddressFamilies = [
+          "AF_UNIX"
+          "AF_ALG"
+          "AF_NETLINK"
+        ];
+      }
+      # Stage 2 only. No test boots the initrd, and these all rest on mount
+      # namespacing there that nothing has exercised. PrivateTmp adds no mount
+      # dependencies here: with DefaultDependencies=no it becomes "disconnected".
+      // lib.optionalAttrs (!initrd) {
+        ProtectHome = true;
+        PrivateTmp = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectHostname = true;
+        RestrictNamespaces = true;
+      };
     };
-  };
 
   # Applies to every systemd-cryptsetup@<volume>.service the generator produces.
   # Wants= rather than Requires= so a daemon that fails to start costs the

@@ -99,10 +99,14 @@ struct Args {
 /// submodule there is freeform, so a key this build does not recognise reaches
 /// the file without Nix noticing, and at boot that silently costs the volume
 /// the feature. Better to fail the build.
+///
+/// `clear-sockets` is `shutdown` as a subcommand, for the times the daemon does
+/// not get to run it itself. See `clear_sockets`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
 	Serve,
 	CheckConfig,
+	ClearSockets,
 }
 
 fn main() -> std::process::ExitCode {
@@ -115,8 +119,10 @@ fn main() -> std::process::ExitCode {
 		}
 	};
 
-	if args.mode == Mode::CheckConfig {
-		return check_config(&args.config);
+	match args.mode {
+		Mode::CheckConfig => return check_config(&args.config),
+		Mode::ClearSockets => return clear_sockets(&args.config, &args.socket_dir),
+		Mode::Serve => {}
 	}
 
 	lock_memory();
@@ -189,13 +195,14 @@ fn parse_from(argv: &[String]) -> Result<Args, String> {
 		socket_dir: sockets::DEFAULT_DIR.to_string(),
 	};
 
-	// A leading word rather than a flag is a subcommand; there is one.
+	// A leading word rather than a flag is a subcommand.
 	let flags = match argv.first() {
 		Some(first) if !first.starts_with('-') => {
-			if first != "check-config" {
-				return Err(format!("unrecognised subcommand {first:?}"));
-			}
-			args.mode = Mode::CheckConfig;
+			args.mode = match first.as_str() {
+				"check-config" => Mode::CheckConfig,
+				"clear-sockets" => Mode::ClearSockets,
+				_ => return Err(format!("unrecognised subcommand {first:?}")),
+			};
 			&argv[1..]
 		}
 		_ => argv,
@@ -210,9 +217,10 @@ fn parse_from(argv: &[String]) -> Result<Args, String> {
 		}
 		match name {
 			"--config" => args.config = value.to_string(),
-			// Nothing is bound in check-config, so accepting it would suggest
-			// this validates something about the socket directory.
-			"--socket-dir" if args.mode == Mode::Serve => args.socket_dir = value.to_string(),
+			// Nothing is looked at in check-config, so accepting it would
+			// suggest this validates something about the socket directory.
+			// clear-sockets needs it: that directory is all it touches.
+			"--socket-dir" if args.mode != Mode::CheckConfig => args.socket_dir = value.to_string(),
 			"--socket-dir" => return Err("check-config takes only --config=".to_string()),
 			_ => return Err(format!("unrecognised argument {arg:?}")),
 		}
@@ -292,12 +300,75 @@ fn listen(dir: &str, volumes: Vec<Volume>) -> Result<Vec<Listener>, String> {
 /// Take the sockets back out of the filesystem.
 ///
 /// /run survives switch-root, so a socket left here is one stage 2's
-/// systemd-cryptsetup will find, connect to, and get nothing from.
+/// systemd-cryptsetup will find and connect to. That is not a fall back to
+/// stock behaviour: with no listener the connect fails, and `find_key_file()`
+/// (src/cryptsetup/cryptsetup-keyfile.c) returns anything but ENOENT and E2BIG
+/// to its caller as a fatal error, so the volume fails to unlock and nobody is
+/// even prompted. Hence the noise level here, and `clear_sockets` for the paths
+/// that do not reach this function at all.
 fn shutdown(listeners: &[Listener]) {
 	for l in listeners {
-		if let Err(e) = sockets::clear(&l.path) {
-			warning!("could not remove {} ({e})", l.path);
+		match sockets::clear(&l.path) {
+			Ok(sockets::Cleared::Kept) => {
+				warning!("{} is not a socket, so it is not ours; leaving it", l.path)
+			}
+			Ok(_) => {}
+			Err(e) => error!(
+				"could not remove {} ({e}); volume {:?} will fail to unlock until it is gone",
+				l.path, l.volume.name
+			),
 		}
+	}
+}
+
+/// `shutdown` for a daemon that did not get to run it.
+///
+/// The accept loop removes the sockets on its way out, but only a process that
+/// reaches that point does: past the unit's stop timeout systemd sends SIGKILL,
+/// and an abort would do the same. What a leftover socket costs is in
+/// `shutdown`'s comment, which is enough to want a second route. Wired up as
+/// `ExecStopPost=`, which systemd runs whatever became of the main process.
+///
+/// It clears only the volumes this config would have been served for, and
+/// `sockets::clear` only ever unlinks sockets, so running it over a directory
+/// holding somebody's real key file does nothing to that file.
+fn clear_sockets(config: &str, dir: &str) -> std::process::ExitCode {
+	// Deliberately the lenient read: a volume the daemon dropped is one it
+	// never bound a socket for either, so there is nothing of ours at its path.
+	let loaded = match config::read(config) {
+		Ok(l) => l,
+		Err(e) => {
+			error!("{e}");
+			return std::process::ExitCode::FAILURE;
+		}
+	};
+
+	let mut stuck = false;
+	for volume in &loaded.volumes {
+		let path = sockets::path(dir, &volume.name);
+		match sockets::clear(&path) {
+			// The ordinary case: the daemon exited cleanly and did this itself.
+			Ok(sockets::Cleared::Absent) => {}
+			Ok(sockets::Cleared::Removed) => {
+				notice!("removed the key socket {path}, which was left behind")
+			}
+			Ok(sockets::Cleared::Kept) => {
+				warning!("{path} is not a socket, so it is not ours; leaving it")
+			}
+			Err(e) => {
+				error!(
+					"could not remove {path} ({e}); volume {:?} will fail to unlock until it is gone",
+					volume.name
+				);
+				stuck = true;
+			}
+		}
+	}
+
+	if stuck {
+		std::process::ExitCode::FAILURE
+	} else {
+		std::process::ExitCode::SUCCESS
 	}
 }
 
@@ -315,6 +386,18 @@ fn catch_sigterm() {
 		libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
 		libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
 	}
+}
+
+/// Whether a stop has been asked for.
+///
+/// Consulted before each multi-second step of serving a connection, not just in
+/// the accept loop. One connection's own budget runs to many minutes -- three
+/// prompts, a KDF pass per candidate, then consent and enrollment -- and
+/// spending all of it after being asked to stop is how the unit reaches its stop
+/// timeout and is killed, which is the one way the sockets outlive the daemon.
+/// See `shutdown`.
+fn terminating() -> bool {
+	TERMINATE.load(Ordering::Relaxed)
 }
 
 /// Pin our pages so key material cannot reach swap.
@@ -389,7 +472,7 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 
 		let woken = rustix::event::poll(&mut polls, Some(&tick));
 
-		if TERMINATE.load(Ordering::Relaxed) {
+		if terminating() {
 			notice!("asked to stop; removing the key sockets");
 			return std::process::ExitCode::SUCCESS;
 		}
@@ -421,6 +504,13 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 				}
 				Err(rustix::io::Errno::INTR) | Err(rustix::io::Errno::AGAIN) => {}
 				Err(e) => error!("volume {:?}: accept failed: {e}", l.volume.name),
+			}
+
+			// Serving one connection can take minutes, so a stop asked for
+			// during it should not wait for the rest of the ready set.
+			if terminating() {
+				notice!("asked to stop; removing the key sockets");
+				return std::process::ExitCode::SUCCESS;
 			}
 		}
 	}
@@ -574,6 +664,14 @@ fn maybe_reenroll(
 	secret: &Secret,
 	decided: &mut consent::Decisions,
 ) {
+	// The passphrase is already in hand and returning it costs nothing, so a
+	// stop asked for here skips the repair and still lets the volume unlock.
+	// Leaving the header as it was is what every preflight refusal does.
+	if terminating() {
+		notice!("volume {volume:?}: leaving the header alone: asked to stop");
+		return;
+	}
+
 	let mut tpm = match tpm2::Tpm::open(&config.tpm2_device) {
 		Ok(t) => t,
 		Err(e) => {
@@ -616,6 +714,13 @@ fn maybe_reenroll(
 	}
 
 	if !decided.accepted(&plan.state) {
+		// A question nobody will be there to answer, at PROMPT_TIMEOUT.
+		if terminating() {
+			notice!(
+				"volume {volume:?}: leaving the header alone: asked to stop before the consent prompt"
+			);
+			return;
+		}
 		match consent::ask(volume, &config.device, &config.pcrs, config.bank) {
 			consent::Answer::No => {
 				notice!("volume {volume:?}: leaving the header alone: re-enrollment was declined");
@@ -632,6 +737,14 @@ fn maybe_reenroll(
 			}
 			consent::Answer::Yes => {}
 		}
+	}
+
+	// The last point worth checking. Past here systemd-cryptenroll has the
+	// header, and verifying what it wrote is read-only and quick, so stopping
+	// between the two would leave the repair unchecked and save nothing.
+	if terminating() {
+		notice!("volume {volume:?}: leaving the header alone: asked to stop before re-enrolling");
+		return;
 	}
 
 	if let Err(e) = enroll::run(
@@ -745,6 +858,10 @@ fn acquire(volume: &str, config: &Volume, device: &Device, cache: &mut Cache) ->
 	}
 
 	for cached in cache.iter() {
+		if terminating() {
+			notice!("volume {volume:?}: asked to stop before a cached passphrase was checked");
+			return None;
+		}
 		match luks::test_passphrase(device, cached) {
 			Verdict::Correct => {
 				info!("volume {volume:?}: answered from a passphrase seen earlier this boot");
@@ -759,6 +876,13 @@ fn acquire(volume: &str, config: &Volume, device: &Device, cache: &mut Cache) ->
 	}
 
 	for attempt in 0..TRIES {
+		// Before the prompt rather than after it: a prompt nobody is going to
+		// answer is the expensive thing here, at PROMPT_TIMEOUT each.
+		if terminating() {
+			notice!("volume {volume:?}: asked to stop before prompting for a passphrase");
+			return None;
+		}
+
 		let which = if attempt == 0 {
 			Attempt::First
 		} else {
@@ -774,6 +898,10 @@ fn acquire(volume: &str, config: &Volume, device: &Device, cache: &mut Cache) ->
 		};
 
 		for candidate in candidates {
+			if terminating() {
+				notice!("volume {volume:?}: asked to stop before a candidate was checked");
+				return None;
+			}
 			match luks::test_passphrase(device, &candidate) {
 				Verdict::Correct => {
 					cache.insert(candidate.clone());
@@ -878,6 +1006,27 @@ mod tests {
 		assert_eq!(
 			actual, expected,
 			"parse_from([\"check-config\", \"--config=/tmp/x.json\"]) returned {actual:?}, expected {expected:?}"
+		);
+	}
+
+	#[test]
+	fn clear_sockets_takes_both_paths() {
+		// ExecStopPost= passes --config=; a hand-run daemon with --socket-dir=
+		// has to be able to tidy up after itself in the same place it bound.
+		let actual = parse_from(&argv(&[
+			"clear-sockets",
+			"--config=/tmp/x.json",
+			"--socket-dir=/tmp/keys",
+		]))
+		.map(|a| (a.mode, a.config, a.socket_dir));
+		let expected = Ok((
+			Mode::ClearSockets,
+			"/tmp/x.json".to_string(),
+			"/tmp/keys".to_string(),
+		));
+		assert_eq!(
+			actual, expected,
+			"parse_from([\"clear-sockets\", \"--config=/tmp/x.json\", \"--socket-dir=/tmp/keys\"]) returned {actual:?}, expected {expected:?}"
 		);
 	}
 
