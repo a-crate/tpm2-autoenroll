@@ -415,7 +415,7 @@ fn serve(listeners: &[Listener]) -> std::process::ExitCode {
 			match rustix::net::accept(&l.fd) {
 				Ok(conn) => {
 					if handle(conn, &l.volume, &mut cache, &mut decided) {
-					    last_contact = Instant::now();
+						last_contact = Instant::now();
 						served.insert(l.volume.name.clone());
 					}
 				}

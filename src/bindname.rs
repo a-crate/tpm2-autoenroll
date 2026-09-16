@@ -91,7 +91,10 @@ pub fn parse(name: &[u8]) -> Option<PeerName<'_>> {
 	if volume.is_empty() {
 		return None;
 	}
-	Some(PeerName { phase: Phase::Unknown, volume })
+	Some(PeerName {
+		phase: Phase::Unknown,
+		volume,
+	})
 }
 
 #[cfg(test)]
@@ -111,7 +114,10 @@ mod tests {
 		let cases = [
 			("d7067f78d9827418/cryptsetup/myvol", Phase::Plain),
 			("d7067f78d9827418/cryptsetup-tpm2/myvol", Phase::Tpm2),
-			("d7067f78d9827418/cryptsetup-fido2-salt/myvol", Phase::Fido2Salt),
+			(
+				"d7067f78d9827418/cryptsetup-fido2-salt/myvol",
+				Phase::Fido2Salt,
+			),
 			("d7067f78d9827418/cryptsetup-pkcs11/myvol", Phase::Pkcs11),
 		];
 		for (input, expected) in cases {
@@ -166,9 +172,15 @@ mod tests {
 			("", "no slash at all"),
 			("d7067f78d9827418", "no slash at all"),
 			("/cryptsetup/root", "empty random prefix"),
-			("not-alnum!/cryptsetup/root", "non-alphanumeric random prefix"),
+			(
+				"not-alnum!/cryptsetup/root",
+				"non-alphanumeric random prefix",
+			),
 			("abc123/cryptsetup/", "empty volume"),
-			("abc123/cryptsetup-future-thing/", "empty volume, unknown infix"),
+			(
+				"abc123/cryptsetup-future-thing/",
+				"empty volume, unknown infix",
+			),
 		];
 		for (input, why) in cases {
 			let actual = phase_of(input);
